@@ -33,3 +33,4 @@ jobs:
         with:
           name: wearos-debug-apk
           path: wearos/build/outputs/apk/debug/wearos-debug.apk
+
