@@ -1,4 +1,4 @@
-package com.music.bitchord.wearos.lyrics
+package com.music.bitchord.wear.ui
 
 import android.app.Application
 import android.net.Uri

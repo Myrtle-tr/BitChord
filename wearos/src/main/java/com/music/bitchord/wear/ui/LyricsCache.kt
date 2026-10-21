@@ -1,4 +1,4 @@
-package com.music.bitchord.wearos.lyrics
+package com.music.bitchord.wear.ui
 
 import android.content.Context
 import android.util.LruCache

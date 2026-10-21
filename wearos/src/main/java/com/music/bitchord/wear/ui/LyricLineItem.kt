@@ -1,4 +1,4 @@
-package com.music.bitchord.wearos.lyrics
+package com.music.bitchord.wear.ui
 
 import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.animateFloatAsState
@@ -24,7 +24,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.sp
-import androidx.wear.compose.material.Text
+import androidx.wear.compose.material3.Text
 import com.music.bitchord.shared.wear.SyncedLine
 import kotlinx.coroutines.delay
 
@@ -110,6 +110,7 @@ fun LyricLineItem(
             },
         textAlign = TextAlign.Center,
         color = if (ambient) LyricsPalette.AmbientPrimary else Color.White,
+        fontFamily = SFPro,
         fontSize = 15.sp,
         lineHeight = 19.sp,
         fontWeight = if (highlight) FontWeight.Bold else FontWeight.Medium,
