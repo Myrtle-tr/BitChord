@@ -75,10 +75,14 @@ private val SwipeThreshold = 64.dp
  *  - touch controls at the foot, fading out after 4 s
  *  - haptic tick on a new line, firmer tick on entering a chorus
  *  - always-on display: the app's own AmbientPlayer covers this screen, the clock drops to 1 Hz
+ *  - playback state comes from the app's NowPlaying stream; transport buttons use PhoneLink's own commands
  */
 @Composable
 fun LyricsScreen(
     np: NowPlaying?,
+    onPrevious: () -> Unit,
+    onNext: () -> Unit,
+    onTogglePlay: () -> Unit,
     modifier: Modifier = Modifier,
     viewModel: LyricsViewModel = viewModel(),
 ) {
@@ -103,6 +107,9 @@ fun LyricsScreen(
 
     LaunchedEffect(ambient.active) { viewModel.setAmbient(ambient.active) }
 
+    // Playback state is the app's own NowPlaying stream; nothing is re-implemented here.
+    LaunchedEffect(np) { viewModel.onNowPlaying(np) }
+
     // Same haptic channel as the rest of the app, so no VIBRATE permission is needed.
     LaunchedEffect(viewModel) {
         viewModel.events.collect { event ->
@@ -125,13 +132,15 @@ fun LyricsScreen(
         LyricsBody(
             state = state,
             positionState = positionState,
+            isPlaying = np?.playing == true,
             hasNext = np?.hasNext ?: true,
+            hasPhone = np != null,
             w = w,
             h = h,
-            onPrevious = viewModel::previous,
-            onNext = viewModel::next,
-            onTogglePlay = viewModel::togglePlayPause,
-            onRetry = viewModel::requestSync,
+            onPrevious = onPrevious,
+            onNext = onNext,
+            onTogglePlay = onTogglePlay,
+            onRetry = viewModel::requestLyrics,
         )
     }
 }
@@ -140,7 +149,9 @@ fun LyricsScreen(
 private fun LyricsBody(
     state: LyricsUiState,
     positionState: State<Long>,
+    isPlaying: Boolean,
     hasNext: Boolean,
+    hasPhone: Boolean,
     w: Dp,
     h: Dp,
     onPrevious: () -> Unit,
@@ -242,7 +253,7 @@ private fun LyricsBody(
             },
     ) {
         if (lines.isEmpty()) {
-            StatusMessage(state = state, onRetry = onRetry)
+            StatusMessage(state = state, hasPhone = hasPhone, onRetry = onRetry)
         } else {
             ScalingLazyColumn(
                 state = listState,
@@ -263,11 +274,7 @@ private fun LyricsBody(
                 contentPadding = PaddingValues(horizontal = 8.dp),
             ) {
                 item(key = "header") {
-                    TrackHeader(
-                        title = state.title,
-                        artist = state.artist,
-                        stale = state.connection == ConnectionState.STALE,
-                    )
+                    TrackHeader(title = state.title, artist = state.artist)
                 }
                 items(count = lines.size, key = { lines[it].index }) { i ->
                     LyricLineItem(
@@ -297,7 +304,7 @@ private fun LyricsBody(
         )
 
         val controlsAlpha by animateFloatAsState(
-            targetValue = if (controlsVisible || !state.isPlaying) 1f else 0.28f,
+            targetValue = if (controlsVisible || !isPlaying) 1f else 0.28f,
             animationSpec = tween(durationMillis = 400),
             label = "lyricsControlsAlpha",
         )
@@ -318,8 +325,8 @@ private fun LyricsBody(
                 onClick = onPrevious,
             )
             GlyphButton(
-                icon = if (state.isPlaying) R.drawable.ic_pause else R.drawable.ic_play,
-                description = stringResource(if (state.isPlaying) R.string.pause else R.string.play),
+                icon = if (isPlaying) R.drawable.ic_pause else R.drawable.ic_play,
+                description = stringResource(if (isPlaying) R.string.pause else R.string.play),
                 size = w * 0.21f,
                 iconSize = w * 0.11f,
                 tint = Color.Black,
@@ -340,7 +347,7 @@ private fun LyricsBody(
 }
 
 @Composable
-private fun TrackHeader(title: String, artist: String, stale: Boolean) {
+private fun TrackHeader(title: String, artist: String) {
     Column(
         horizontalAlignment = Alignment.CenterHorizontally,
         modifier = Modifier.padding(horizontal = 40.dp, vertical = 8.dp),
@@ -354,9 +361,9 @@ private fun TrackHeader(title: String, artist: String, stale: Boolean) {
             textAlign = TextAlign.Center,
         )
         Text(
-            text = if (stale) stringResource(R.string.wear_lyrics_stale) else artist,
+            text = artist,
             style = WearType.caption,
-            color = if (stale) Color(0xFFFFB74D) else LyricsPalette.Cyan.copy(alpha = 0.8f),
+            color = LyricsPalette.Cyan.copy(alpha = 0.8f),
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
             textAlign = TextAlign.Center,
@@ -365,11 +372,9 @@ private fun TrackHeader(title: String, artist: String, stale: Boolean) {
 }
 
 @Composable
-private fun StatusMessage(state: LyricsUiState, onRetry: () -> Unit) {
+private fun StatusMessage(state: LyricsUiState, hasPhone: Boolean, onRetry: () -> Unit) {
     val message = when {
-        state.connection == ConnectionState.STALE -> stringResource(R.string.wear_lyrics_stale_tap)
-        state.connection == ConnectionState.WAITING && state.trackId == null ->
-            stringResource(R.string.wear_lyrics_waiting)
+        !hasPhone || state.trackId == null -> stringResource(R.string.wear_lyrics_waiting)
         state.lyricsStatus == LyricsStatus.UNAVAILABLE -> stringResource(R.string.wear_lyrics_none)
         else -> stringResource(R.string.wear_lyrics_loading)
     }

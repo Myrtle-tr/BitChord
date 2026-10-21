@@ -13,16 +13,12 @@ import com.google.android.gms.wearable.DataEvent
 import com.google.android.gms.wearable.DataEventBuffer
 import com.google.android.gms.wearable.DataMap
 import com.google.android.gms.wearable.DataMapItem
-import com.google.android.gms.wearable.MessageClient
-import com.google.android.gms.wearable.MessageEvent
 import com.google.android.gms.wearable.PutDataRequest
 import com.google.android.gms.wearable.Wearable
-import com.music.bitchord.shared.wear.PlaybackCommand
-import com.music.bitchord.shared.wear.PlaybackSyncMessage
-import com.music.bitchord.shared.wear.SyncEvent
 import com.music.bitchord.shared.wear.SyncedLine
 import com.music.bitchord.shared.wear.SyncedLyricsPayload
 import com.music.bitchord.shared.wear.WearSyncPaths
+import com.music.bitchord.wear.data.NowPlaying
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -41,8 +37,6 @@ import kotlinx.coroutines.tasks.await
 import kotlinx.coroutines.withContext
 import kotlin.math.abs
 
-enum class ConnectionState { WAITING, CONNECTED, STALE }
-
 enum class LyricsStatus { IDLE, LOADING, READY, UNAVAILABLE }
 
 data class LyricsUiState(
@@ -53,7 +47,6 @@ data class LyricsUiState(
     val lyricsStatus: LyricsStatus = LyricsStatus.IDLE,
     val isPlaying: Boolean = false,
     val activeLineIndex: Int = -1,
-    val connection: ConnectionState = ConnectionState.WAITING,
 )
 
 sealed interface LyricsEvent {
@@ -65,18 +58,25 @@ sealed interface LyricsEvent {
 }
 
 /**
- * Receives phone events (DataClient + MessageClient), keeps a local playback clock and exposes:
- *  - [state]      low-frequency UI state (changes on track / line / play-pause)
- *  - [positionMs] interpolated position, ~60 Hz while playing & visible, 1 Hz in ambient
+ * Lyrics for the watch.
+ *
+ * Playback state is NOT re-implemented here: the phone already publishes what is playing, with the
+ * position and the instant it was true (see NowPlaying.positionAt), and PhoneLink already turns
+ * that into the [NowPlaying] stream. This class takes that stream through [onNowPlaying] and adds:
+ *
+ *  - [state]      low-frequency UI state (track, lyrics, active line)
+ *  - [positionMs] a local clock, ~60 Hz while playing and visible, 1 Hz in ambient
  *  - [events]     haptic triggers
  *
- * Clock model: position = anchor + elapsed * speed, plus a decaying "blend" term.
- *  - drift > [WearSyncPaths.DRIFT_SNAP_THRESHOLD_MS]: snap immediately
- *  - otherwise: re-anchor and blend the visible error out linearly over [BLEND_WINDOW_MS]
+ * Clock: position = NowPlaying.positionAt(now) + a decaying "blend" term. When a new NowPlaying
+ * arrives and the visible position is off by more than [WearSyncPaths.DRIFT_SNAP_THRESHOLD_MS] it
+ * snaps; otherwise the error is faded out linearly over [BLEND_WINDOW_MS], so lyrics never jump.
+ *
+ * Lyrics come from the phone as a Data Layer item (gzip asset). They are cached on the watch, so a
+ * repeated track never needs another transfer; on a cache miss the phone is asked for them.
  */
 class LyricsViewModel(application: Application) : AndroidViewModel(application),
-    DataClient.OnDataChangedListener,
-    MessageClient.OnMessageReceivedListener {
+    DataClient.OnDataChangedListener {
 
     private val dataClient = Wearable.getDataClient(application)
     private val messageClient = Wearable.getMessageClient(application)
@@ -96,15 +96,12 @@ class LyricsViewModel(application: Application) : AndroidViewModel(application),
     val events: SharedFlow<LyricsEvent> = _events.asSharedFlow()
 
     // --- Clock (main thread only) ---------------------------------------------------
+    private var nowPlaying: NowPlaying? = null
     private var payload: SyncedLyricsPayload? = null
     private var durationMs = 0L
     private var playing = false
-    private var speed = 1f
-    private var anchorPositionMs = 0L
-    private var anchorElapsedMs = SystemClock.elapsedRealtime()
     private var blendFromMs = 0L
     private var blendStartElapsedMs = 0L
-    private var lastPhoneContactElapsedMs = 0L
     private var hapticSuppressUntilElapsedMs = 0L
 
     private var ambient = false
@@ -114,27 +111,60 @@ class LyricsViewModel(application: Application) : AndroidViewModel(application),
 
     init {
         dataClient.addListener(this)
-        messageClient.addListener(this)
-        viewModelScope.launch {
-            restoreLatestPayload()
-            requestSync()
-        }
+        viewModelScope.launch { restoreLatestPayload() }
     }
 
     // ---------------------------------------------------------------------------------
     // Public API for the UI
     // ---------------------------------------------------------------------------------
 
-    fun setUiVisible(visible: Boolean) {
-        uiVisible = visible
-        if (visible) {
-            if (_state.value.connection != ConnectionState.CONNECTED) requestSync()
+    /** Feed every NowPlaying the app already collects. */
+    fun onNowPlaying(np: NowPlaying?) {
+        val old = nowPlaying
+        if (np == null) {
+            nowPlaying = null
+            playing = false
+            _state.update { it.copy(isPlaying = false) }
             tick()
+            return
         }
+
+        val shown = if (old != null) currentPositionMs() else 0L
+        nowPlaying = np
+
+        val id: String? = np.mediaId
+        val trackChanged = id != _state.value.trackId
+        if (trackChanged) {
+            startTrack(id, np.title, np.artist)
+        } else if (_state.value.title != np.title || _state.value.artist != np.artist) {
+            _state.update { it.copy(title = np.title, artist = np.artist) }
+        }
+        if (np.durationMs > 0) durationMs = np.durationMs
+
+        val now = SystemClock.elapsedRealtime()
+        val target = np.positionAt(System.currentTimeMillis()) + CLOCK_TRIM_MS
+        val drift = shown - target
+        val smooth = old != null && !trackChanged && old.advancing && np.advancing &&
+            abs(drift) <= WearSyncPaths.DRIFT_SNAP_THRESHOLD_MS
+        blendFromMs = if (smooth) drift else 0L
+        blendStartElapsedMs = now
+        if (!smooth) hapticSuppressUntilElapsedMs = now + HAPTIC_SUPPRESS_AFTER_SNAP_MS
+
+        playing = np.advancing
+        _state.update { it.copy(isPlaying = np.advancing) }
+
+        if (trackChanged && !id.isNullOrEmpty()) ensureLyrics(id)
+        tick()
         updateTicker()
     }
 
-    /** Ambient (AOD): the ticker drops to 1 Hz; the UI simplifies itself. */
+    fun setUiVisible(visible: Boolean) {
+        uiVisible = visible
+        if (visible) tick()
+        updateTicker()
+    }
+
+    /** Ambient (AOD): the ticker drops to 1 Hz. */
     fun setAmbient(value: Boolean) {
         if (ambient == value) return
         ambient = value
@@ -142,27 +172,14 @@ class LyricsViewModel(application: Application) : AndroidViewModel(application),
         updateTicker()
     }
 
-    fun togglePlayPause() {
-        val wasPlaying = playing
-        snapTo(currentPositionMs(), !wasPlaying, speed) // optimistic; phone confirms
-        sendCommand(if (wasPlaying) PlaybackCommand.PAUSE else PlaybackCommand.PLAY)
-    }
-
-    fun next() = sendCommand(PlaybackCommand.NEXT)
-
-    fun previous() = sendCommand(PlaybackCommand.PREVIOUS)
-
-    fun sendCommand(command: PlaybackCommand) {
-        viewModelScope.launch { sendToPhone(WearSyncPaths.PLAYBACK_COMMAND, command.toBytes()) }
-    }
-
-    /** Ask the phone for the current state (cold start, reconnect, user tapped "retry"). */
-    fun requestSync() {
-        viewModelScope.launch { sendToPhone(WearSyncPaths.LYRICS_REQUEST, ByteArray(0)) }
+    /** Ask the phone to send the lyrics of the current track again. */
+    fun requestLyrics() {
+        val id = _state.value.trackId ?: return
+        viewModelScope.launch { sendLyricsRequest(id) }
     }
 
     // ---------------------------------------------------------------------------------
-    // Data Layer callbacks
+    // Data Layer: lyrics payload
     // ---------------------------------------------------------------------------------
 
     override fun onDataChanged(events: DataEventBuffer) {
@@ -174,188 +191,9 @@ class LyricsViewModel(application: Application) : AndroidViewModel(application),
         viewModelScope.launch { handlePayloadDataMap(latest) }
     }
 
-    override fun onMessageReceived(event: MessageEvent) {
-        val path = event.path
-        if (path != WearSyncPaths.PLAYBACK_STATE && path != WearSyncPaths.PLAYBACK_HEARTBEAT) return
-        val message = PlaybackSyncMessage.fromBytes(event.data) ?: return
-        viewModelScope.launch { handlePlaybackMessage(message) }
-    }
-
     override fun onCleared() {
         dataClient.removeListener(this)
-        messageClient.removeListener(this)
         super.onCleared()
-    }
-
-    // ---------------------------------------------------------------------------------
-    // Playback messages
-    // ---------------------------------------------------------------------------------
-
-    private fun handlePlaybackMessage(msg: PlaybackSyncMessage) {
-        lastPhoneContactElapsedMs = SystemClock.elapsedRealtime()
-        if (_state.value.connection != ConnectionState.CONNECTED) {
-            _state.update { it.copy(connection = ConnectionState.CONNECTED) }
-        }
-
-        val trackChanged = msg.trackId != null && msg.trackId != _state.value.trackId
-        if (trackChanged) startTrack(msg)
-        if (msg.durationMs > 0) durationMs = msg.durationMs
-        if (msg.trackId != null && msg.lyricsHash != null) ensureLyrics(msg.trackId!!, msg.lyricsHash!!)
-
-        val estimate = estimatePosition(msg)
-        val isHeartbeat = msg.event == SyncEvent.HEARTBEAT
-        if (isHeartbeat && !trackChanged && playing && msg.isPlaying) {
-            correctDrift(estimate, msg.speed)
-        } else {
-            snapTo(estimate, msg.isPlaying, msg.speed)
-        }
-    }
-
-    /** Phone position "now": reported position + clamped transit latency (only while playing). */
-    private fun estimatePosition(msg: PlaybackSyncMessage): Long {
-        if (!msg.isPlaying) return msg.positionMs
-        val latency = (System.currentTimeMillis() - msg.sentAtWallMs).coerceIn(0L, MAX_LATENCY_MS)
-        return msg.positionMs + (latency * msg.speed).toLong()
-    }
-
-    private fun startTrack(msg: PlaybackSyncMessage) {
-        lyricsRequestJob?.cancel()
-        payload = null
-        _state.update {
-            it.copy(
-                trackId = msg.trackId,
-                title = msg.title,
-                artist = msg.artist,
-                lines = emptyList(),
-                lyricsStatus = LyricsStatus.LOADING,
-                activeLineIndex = -1,
-            )
-        }
-    }
-
-    // ---------------------------------------------------------------------------------
-    // Clock
-    // ---------------------------------------------------------------------------------
-
-    private fun currentPositionMs(now: Long = SystemClock.elapsedRealtime()): Long {
-        val base = if (playing) {
-            anchorPositionMs + ((now - anchorElapsedMs) * speed).toLong()
-        } else {
-            anchorPositionMs
-        }
-        val t = ((now - blendStartElapsedMs).toFloat() / BLEND_WINDOW_MS).coerceIn(0f, 1f)
-        val blended = base + (blendFromMs * (1f - t)).toLong()
-        val max = if (durationMs > 0) durationMs else Long.MAX_VALUE
-        return blended.coerceIn(0L, max)
-    }
-
-    private fun snapTo(positionMs: Long, isPlaying: Boolean, newSpeed: Float) {
-        val now = SystemClock.elapsedRealtime()
-        anchorPositionMs = positionMs
-        anchorElapsedMs = now
-        blendFromMs = 0L
-        blendStartElapsedMs = now
-        playing = isPlaying
-        speed = newSpeed
-        hapticSuppressUntilElapsedMs = now + HAPTIC_SUPPRESS_AFTER_SNAP_MS
-        _state.update { it.copy(isPlaying = isPlaying) }
-        tick()
-        updateTicker()
-    }
-
-    private fun correctDrift(estimateMs: Long, newSpeed: Float) {
-        val now = SystemClock.elapsedRealtime()
-        val shown = currentPositionMs(now)
-        val drift = estimateMs - shown
-        if (abs(drift) > WearSyncPaths.DRIFT_SNAP_THRESHOLD_MS) {
-            snapTo(estimateMs, true, newSpeed)
-            return
-        }
-        // Re-anchor to the phone's truth, but keep the *visible* position continuous and let the
-        // error fade out linearly: shown(t0) == estimate + blendFrom  =>  blendFrom = -drift.
-        anchorPositionMs = estimateMs
-        anchorElapsedMs = now
-        blendFromMs = -drift
-        blendStartElapsedMs = now
-        speed = newSpeed
-    }
-
-    private fun updateTicker() {
-        if (!(playing && uiVisible)) return
-        if (tickerJob?.isActive == true) return
-        tickerJob = viewModelScope.launch {
-            while (isActive && playing && uiVisible) {
-                tick()
-                delay(if (ambient) AMBIENT_TICK_MS else FRAME_MS)
-            }
-        }
-    }
-
-    private fun tick() {
-        val now = SystemClock.elapsedRealtime()
-
-        // Watchdog: playing but the phone went silent -> freeze the clock instead of drifting forever.
-        if (playing && lastPhoneContactElapsedMs != 0L &&
-            now - lastPhoneContactElapsedMs > HEARTBEAT_TIMEOUT_MS
-        ) {
-            anchorPositionMs = currentPositionMs(now)
-            anchorElapsedMs = now
-            blendFromMs = 0L
-            blendStartElapsedMs = now
-            playing = false
-            _state.update { it.copy(isPlaying = false, connection = ConnectionState.STALE) }
-        }
-
-        val pos = currentPositionMs(now)
-        _positionMs.value = pos
-
-        val p = payload
-        val idx = p?.lineIndexAt(pos) ?: -1
-        val prevIdx = _state.value.activeLineIndex
-        if (idx == prevIdx) return
-
-        _state.update { it.copy(activeLineIndex = idx) }
-
-        val natural = p != null && idx >= 0 && idx == prevIdx + 1 &&
-            playing && !ambient && now >= hapticSuppressUntilElapsedMs
-        if (natural) {
-            val line = p!!.lines[idx]
-            val prevLine = p.lines.getOrNull(prevIdx)
-            _events.tryEmit(
-                if (line.isChorus && prevLine?.isChorus != true) LyricsEvent.ChorusEntered
-                else LyricsEvent.LineChanged,
-            )
-        }
-    }
-
-    // ---------------------------------------------------------------------------------
-    // Lyrics loading: cache first, DataItem second, explicit request last
-    // ---------------------------------------------------------------------------------
-
-    private fun ensureLyrics(trackId: String, hash: String) {
-        val current = payload
-        if (hash == WearSyncPaths.NO_LYRICS_HASH) {
-            if (current?.trackId != trackId) {
-                _state.update { it.copy(lyricsStatus = LyricsStatus.UNAVAILABLE, lines = emptyList()) }
-            }
-            return
-        }
-        if (current != null && current.trackId == trackId && current.contentHash == hash) return
-
-        lyricsRequestJob?.cancel()
-        lyricsRequestJob = viewModelScope.launch {
-            cache.get(trackId, hash)?.let {
-                adoptPayload(it)
-                return@launch
-            }
-            _state.update { it.copy(lyricsStatus = LyricsStatus.LOADING) }
-            // The phone usually pushes the DataItem on its own; give it a moment before asking.
-            delay(PAYLOAD_GRACE_MS)
-            val now = payload
-            if (now == null || now.trackId != trackId || now.contentHash != hash) {
-                sendToPhone(WearSyncPaths.LYRICS_REQUEST, trackId.toByteArray(Charsets.UTF_8))
-            }
-        }
     }
 
     private suspend fun restoreLatestPayload() {
@@ -381,6 +219,18 @@ class LyricsViewModel(application: Application) : AndroidViewModel(application),
     private suspend fun handlePayloadDataMap(map: DataMap) {
         val trackId = map.getString(WearSyncPaths.KEY_TRACK_ID) ?: return
         val hash = map.getString(WearSyncPaths.KEY_HASH)
+        val known = _state.value.trackId
+
+        // The phone looked and found nothing for this track.
+        if (hash == WearSyncPaths.NO_LYRICS_HASH) {
+            if (known == trackId) {
+                payload = null
+                _state.update {
+                    it.copy(lines = emptyList(), lyricsStatus = LyricsStatus.UNAVAILABLE, activeLineIndex = -1)
+                }
+            }
+            return
+        }
 
         val current = payload
         if (current != null && current.trackId == trackId && current.contentHash == hash) return
@@ -392,9 +242,7 @@ class LyricsViewModel(application: Application) : AndroidViewModel(application),
             fresh
         }
 
-        // A stale DataItem for another track must not overwrite what the phone is playing now;
-        // it is cached, and TRACK/HEARTBEAT will pull it from the cache if it becomes current.
-        val known = _state.value.trackId
+        // An item for a track that is not the one playing is only cached, never shown.
         if (known == null || known == loaded.trackId) adoptPayload(loaded)
     }
 
@@ -414,6 +262,36 @@ class LyricsViewModel(application: Application) : AndroidViewModel(application),
         null
     }
 
+    private fun startTrack(id: String?, title: String, artist: String) {
+        lyricsRequestJob?.cancel()
+        payload = null
+        _state.update {
+            it.copy(
+                trackId = id,
+                title = title,
+                artist = artist,
+                lines = emptyList(),
+                lyricsStatus = if (id.isNullOrEmpty()) LyricsStatus.IDLE else LyricsStatus.LOADING,
+                activeLineIndex = -1,
+            )
+        }
+    }
+
+    /** Cache first. Otherwise wait a moment for the phone's own push, then ask for it. */
+    private fun ensureLyrics(trackId: String) {
+        lyricsRequestJob?.cancel()
+        lyricsRequestJob = viewModelScope.launch {
+            cache.get(trackId)?.let {
+                adoptPayload(it)
+                return@launch
+            }
+            delay(PAYLOAD_GRACE_MS)
+            if (payload?.trackId != trackId && _state.value.lyricsStatus == LyricsStatus.LOADING) {
+                sendLyricsRequest(trackId)
+            }
+        }
+    }
+
     private suspend fun adoptPayload(p: SyncedLyricsPayload) {
         payload = p
         _state.update {
@@ -429,16 +307,13 @@ class LyricsViewModel(application: Application) : AndroidViewModel(application),
         if (p.durationMs > 0 && durationMs == 0L) durationMs = p.durationMs
         hapticSuppressUntilElapsedMs = SystemClock.elapsedRealtime() + HAPTIC_SUPPRESS_AFTER_SNAP_MS
         tick()
-        cache.put(p) // no-op overwrite when it came from the cache; refreshes LRU order
+        cache.put(p) // refreshes LRU order, or stores a newer version
     }
 
-    // ---------------------------------------------------------------------------------
-    // Transport
-    // ---------------------------------------------------------------------------------
-
-    private suspend fun sendToPhone(path: String, body: ByteArray) {
+    private suspend fun sendLyricsRequest(trackId: String) {
         val nodes = nodeClient.connectedNodes.awaitOrNull().orEmpty()
-        nodes.forEach { messageClient.sendMessage(it.id, path, body).awaitOrNull() }
+        val body = trackId.toByteArray(Charsets.UTF_8)
+        nodes.forEach { messageClient.sendMessage(it.id, WearSyncPaths.LYRICS_REQUEST, body).awaitOrNull() }
     }
 
     private suspend fun <T> Task<T>.awaitOrNull(): T? = try {
@@ -449,14 +324,67 @@ class LyricsViewModel(application: Application) : AndroidViewModel(application),
         null
     }
 
+    // ---------------------------------------------------------------------------------
+    // Clock
+    // ---------------------------------------------------------------------------------
+
+    private fun currentPositionMs(): Long {
+        val np = nowPlaying ?: return 0L
+        val base = np.positionAt(System.currentTimeMillis()) + CLOCK_TRIM_MS
+        val t = ((SystemClock.elapsedRealtime() - blendStartElapsedMs).toFloat() / BLEND_WINDOW_MS)
+            .coerceIn(0f, 1f)
+        val blended = base + (blendFromMs * (1f - t)).toLong()
+        val max = if (durationMs > 0) durationMs else Long.MAX_VALUE
+        return blended.coerceIn(0L, max)
+    }
+
+    private fun updateTicker() {
+        if (!(playing && uiVisible)) return
+        if (tickerJob?.isActive == true) return
+        tickerJob = viewModelScope.launch {
+            while (isActive && playing && uiVisible) {
+                tick()
+                delay(if (ambient) AMBIENT_TICK_MS else FRAME_MS)
+            }
+        }
+    }
+
+    private fun tick() {
+        val now = SystemClock.elapsedRealtime()
+        val pos = currentPositionMs()
+        _positionMs.value = pos
+
+        val p = payload
+        val idx = p?.lineIndexAt(pos) ?: -1
+        val prevIdx = _state.value.activeLineIndex
+        if (idx == prevIdx) return
+
+        _state.update { it.copy(activeLineIndex = idx) }
+
+        val natural = p != null && idx >= 0 && idx == prevIdx + 1 &&
+            playing && !ambient && now >= hapticSuppressUntilElapsedMs
+        if (natural) {
+            val line = p!!.lines[idx]
+            val prevLine = p.lines.getOrNull(prevIdx)
+            _events.tryEmit(
+                if (line.isChorus && prevLine?.isChorus != true) LyricsEvent.ChorusEntered
+                else LyricsEvent.LineChanged,
+            )
+        }
+    }
+
     private companion object {
         const val TAG = "LyricsViewModel"
         const val FRAME_MS = 16L
         const val AMBIENT_TICK_MS = 1_000L
         const val BLEND_WINDOW_MS = 2_500L
-        const val MAX_LATENCY_MS = 1_500L
-        const val HEARTBEAT_TIMEOUT_MS = 15_000L
         const val PAYLOAD_GRACE_MS = 1_500L
         const val HAPTIC_SUPPRESS_AFTER_SNAP_MS = 250L
+
+        /**
+         * Phone and watch clocks are compared through wall time. If lyrics sit consistently early
+         * or late on your watch, nudge this (positive = lyrics appear earlier, negative = later).
+         */
+        const val CLOCK_TRIM_MS = 0L
     }
 }

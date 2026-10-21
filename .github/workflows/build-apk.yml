@@ -1,0 +1,76 @@
+name: Build phone APK (with watch app inside)
+
+# One phone APK. The watch APK is built and bundled into it by :app itself (bundleWearApk),
+# which is what the in-app "BitChord for Wear OS" installer sends to the watch.
+#
+# Signing:
+#  - secrets KEYSTORE_B64 / KEYSTORE_PASSWORD / KEY_ALIAS / KEY_PASSWORD present -> prodRelease,
+#    signed with YOUR key (phone and watch with the same key; updates keep working)
+#  - otherwise -> prodDebug, signed with a throw-away debug key (installs, pairs, but every build
+#    has a different signature, so each one must be installed over an uninstalled copy)
+
+on:
+  workflow_dispatch:
+    inputs:
+      force_debug:
+        description: "Build prodDebug even if signing secrets exist"
+        type: boolean
+        default: false
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+
+concurrency:
+  group: build-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: android-actions/setup-android@v3
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Signing
+        id: signing
+        env:
+          KEYSTORE_B64: ${{ secrets.KEYSTORE_B64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          FORCE_DEBUG: ${{ inputs.force_debug }}
+        run: |
+          if [ -n "$KEYSTORE_B64" ] && [ "$FORCE_DEBUG" != "true" ]; then
+            echo "$KEYSTORE_B64" | base64 -d > release.keystore
+            printf 'storeFile=release.keystore\nstorePassword=%s\nkeyAlias=%s\nkeyPassword=%s\n' \
+              "$KEYSTORE_PASSWORD" "$KEY_ALIAS" "$KEY_PASSWORD" > keystore.properties
+            echo "task=:app:assembleProdRelease" >> "$GITHUB_OUTPUT"
+            echo "Building prodRelease, signed with the repository secret key"
+          else
+            echo "task=:app:assembleProdDebug" >> "$GITHUB_OUTPUT"
+            echo "Building prodDebug (debug key)"
+          fi
+
+      - name: Build
+        run: ./gradlew ${{ steps.signing.outputs.task }} --stacktrace --console=plain
+
+      - name: Show what was built
+        run: |
+          find app/build/outputs/apk -name '*.apk' -exec ls -lh {} \;
+          find app/build -name 'BitChordWear.apk' -exec ls -lh {} \; | head -3
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: BitChord-phone-with-watch-app
+          path: app/build/outputs/apk/prod/**/*.apk
+          if-no-files-found: error

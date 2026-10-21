@@ -85,7 +85,12 @@ fun WearApp(link: PhoneLink) {
                 MoreScreen(np = np, link = link, onOpenOutput = { nav.navigate(OUTPUT) })
             }
             composable(LYRICS) {
-                LyricsScreen(np = np)
+                LyricsScreen(
+                    np = np,
+                    onPrevious = link::previous,
+                    onNext = link::next,
+                    onTogglePlay = link::togglePlay,
+                )
             }
             composable(OUTPUT) {
                 // Straight back to the player once a choice is made.
