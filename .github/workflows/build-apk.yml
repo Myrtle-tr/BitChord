@@ -2,7 +2,7 @@ name: Build phone APK (with watch app inside)
 
 # One phone APK; the watch APK is built and bundled into it by :app itself (bundleWearApk).
 # Secrets KEYSTORE_B64 / KEYSTORE_PASSWORD / KEY_ALIAS / KEY_PASSWORD present -> prodRelease,
-# signed with your key. Otherwise prodDebug with a throw-away debug key.
+# signed with your key. Otherwise (or with force_debug) prodDebug with a throw-away debug key.
 
 on:
   workflow_dispatch:
@@ -33,6 +33,25 @@ jobs:
           java-version: "17"
 
       - uses: gradle/actions/setup-gradle@v4
+
+      - name: Install NDK (with retries)
+        run: |
+          NDK=$(grep -oP 'ndkVersion\s*=\s*"\K[^"]+' app/build.gradle.kts | head -1)
+          NDK=${NDK:-27.0.12077973}
+          echo "NDK version: $NDK"
+          SDKM=$(ls -d "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager | sort -V | tail -1)
+          yes | "$SDKM" --licenses > /dev/null || true
+          for attempt in 1 2 3 4; do
+            if "$SDKM" --install "ndk;$NDK" && [ -f "$ANDROID_HOME/ndk/$NDK/source.properties" ]; then
+              echo "NDK $NDK installed"
+              exit 0
+            fi
+            echo "NDK install failed (attempt $attempt), retrying in 15s..."
+            rm -rf "$ANDROID_HOME/ndk/$NDK" "$ANDROID_HOME/.temp" 2>/dev/null || true
+            sleep 15
+          done
+          echo "NDK $NDK could not be installed"
+          exit 1
 
       - name: Signing
         id: signing
