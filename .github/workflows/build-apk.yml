@@ -7,8 +7,13 @@ name: Build phone APK (with watch app inside)
 on:
   workflow_dispatch:
     inputs:
+      flavor:
+        description: "Prod = com.music.bitchord (replaces the official app), Dev = com.dev.bitchord (installs next to it)"
+        type: choice
+        options: [Prod, Dev]
+        default: Prod
       force_debug:
-        description: "Build prodDebug even if signing secrets exist"
+        description: "Build a debug-signed APK even if signing secrets exist"
         type: boolean
         default: false
   push:
@@ -61,15 +66,16 @@ jobs:
           KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
           FORCE_DEBUG: ${{ inputs.force_debug }}
+          FLAVOR: ${{ inputs.flavor || 'Prod' }}
         run: |
           if [ -n "$KEYSTORE_B64" ] && [ "$FORCE_DEBUG" != "true" ]; then
             echo "$KEYSTORE_B64" | base64 -d > release.keystore
             printf 'storeFile=release.keystore\nstorePassword=%s\nkeyAlias=%s\nkeyPassword=%s\n' \
               "$KEYSTORE_PASSWORD" "$KEY_ALIAS" "$KEY_PASSWORD" > keystore.properties
-            echo "task=:app:assembleProdRelease" >> "$GITHUB_OUTPUT"
+            echo "task=:app:assemble${FLAVOR}Release" >> "$GITHUB_OUTPUT"
             echo "Building prodRelease, signed with the repository secret key"
           else
-            echo "task=:app:assembleProdDebug" >> "$GITHUB_OUTPUT"
+            echo "task=:app:assemble${FLAVOR}Debug" >> "$GITHUB_OUTPUT"
             echo "Building prodDebug (debug key)"
           fi
 
@@ -87,5 +93,5 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: BitChord-phone-with-watch-app
-          path: app/build/outputs/apk/prod/**/*.apk
+          path: app/build/outputs/apk/**/*.apk
           if-no-files-found: error
