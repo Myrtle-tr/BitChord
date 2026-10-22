@@ -1,13 +1,8 @@
 name: Build phone APK (with watch app inside)
 
-# One phone APK. The watch APK is built and bundled into it by :app itself (bundleWearApk),
-# which is what the in-app "BitChord for Wear OS" installer sends to the watch.
-#
-# Signing:
-#  - secrets KEYSTORE_B64 / KEYSTORE_PASSWORD / KEY_ALIAS / KEY_PASSWORD present -> prodRelease,
-#    signed with YOUR key (phone and watch with the same key; updates keep working)
-#  - otherwise -> prodDebug, signed with a throw-away debug key (installs, pairs, but every build
-#    has a different signature, so each one must be installed over an uninstalled copy)
+# One phone APK; the watch APK is built and bundled into it by :app itself (bundleWearApk).
+# Secrets KEYSTORE_B64 / KEYSTORE_PASSWORD / KEY_ALIAS / KEY_PASSWORD present -> prodRelease,
+# signed with your key. Otherwise prodDebug with a throw-away debug key.
 
 on:
   workflow_dispatch:
@@ -37,8 +32,6 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      - uses: android-actions/setup-android@v3
-
       - uses: gradle/actions/setup-gradle@v4
 
       - name: Signing
@@ -60,6 +53,9 @@ jobs:
             echo "task=:app:assembleProdDebug" >> "$GITHUB_OUTPUT"
             echo "Building prodDebug (debug key)"
           fi
+
+      - name: Make gradlew executable
+        run: chmod +x gradlew
 
       - name: Build
         run: ./gradlew ${{ steps.signing.outputs.task }} --stacktrace --console=plain
