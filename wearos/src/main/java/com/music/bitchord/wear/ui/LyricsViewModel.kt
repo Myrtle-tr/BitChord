@@ -13,6 +13,8 @@ import com.google.android.gms.wearable.DataEvent
 import com.google.android.gms.wearable.DataEventBuffer
 import com.google.android.gms.wearable.DataMap
 import com.google.android.gms.wearable.DataMapItem
+import com.google.android.gms.wearable.MessageClient
+import com.google.android.gms.wearable.MessageEvent
 import com.google.android.gms.wearable.PutDataRequest
 import com.google.android.gms.wearable.Wearable
 import com.music.bitchord.shared.wear.SyncedLine
@@ -35,6 +37,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.tasks.await
 import kotlinx.coroutines.withContext
+import java.nio.ByteBuffer
 import kotlin.math.abs
 
 enum class LyricsStatus { IDLE, LOADING, READY, UNAVAILABLE }
@@ -68,7 +71,13 @@ sealed interface LyricsEvent {
  *  - [positionMs] a local clock, ~60 Hz while playing and visible, 1 Hz in ambient
  *  - [events]     haptic triggers
  *
- * Clock: position = NowPlaying.positionAt(now) + a decaying "blend" term. When a new NowPlaying
+ * Clock: the phone stamps each reading with ITS wall clock, so the watch cannot simply compare that
+ * stamp with its own: a few seconds of difference between the two clocks would put the lyrics a
+ * line or two ahead while playing (and right again when paused, where nothing runs on). The offset
+ * between the clocks is measured with a ping to the phone (shortest round trip wins, as ServerClock
+ * does in :shared) and every reading is converted to watch time before use.
+ *
+ * Position = reading + time run on since its stamp + a decaying "blend" term. When a new NowPlaying
  * arrives and the visible position is off by more than [WearSyncPaths.DRIFT_SNAP_THRESHOLD_MS] it
  * snaps; otherwise the error is faded out linearly over [BLEND_WINDOW_MS], so lyrics never jump.
  *
@@ -76,7 +85,8 @@ sealed interface LyricsEvent {
  * repeated track never needs another transfer; on a cache miss the phone is asked for them.
  */
 class LyricsViewModel(application: Application) : AndroidViewModel(application),
-    DataClient.OnDataChangedListener {
+    DataClient.OnDataChangedListener,
+    MessageClient.OnMessageReceivedListener {
 
     private val dataClient = Wearable.getDataClient(application)
     private val messageClient = Wearable.getMessageClient(application)
@@ -104,6 +114,19 @@ class LyricsViewModel(application: Application) : AndroidViewModel(application),
     private var blendStartElapsedMs = 0L
     private var hapticSuppressUntilElapsedMs = 0L
 
+    // --- Phone <-> watch clock offset ------------------------------------------------
+    private class ClockSample(val offsetMs: Long, val rttMs: Long, val atElapsedMs: Long)
+
+    private val clockSamples = ArrayList<ClockSample>()
+
+    /** phoneWall - watchWall. Zero until the first ping comes back. */
+    private var clockOffsetMs = 0L
+    private var clockJob: Job? = null
+
+    /** The stamp of the NowPlaying last classified, and whether it was made on THIS watch's clock. */
+    private var lastStamp = -1L
+    private var stampIsLocal = false
+
     private var ambient = false
     private var uiVisible = false
     private var tickerJob: Job? = null
@@ -111,6 +134,7 @@ class LyricsViewModel(application: Application) : AndroidViewModel(application),
 
     init {
         dataClient.addListener(this)
+        messageClient.addListener(this)
         viewModelScope.launch { restoreLatestPayload() }
     }
 
@@ -132,6 +156,14 @@ class LyricsViewModel(application: Application) : AndroidViewModel(application),
         val shown = if (old != null) currentPositionMs() else 0L
         nowPlaying = np
 
+        // PhoneLink stamps its own local edits (pause, seek) with this watch's clock, the phone's
+        // readings carry the phone's. A stamp that is "now" can only be the former, and it is
+        // judged when the reading first arrives, not on later looks at the same one.
+        if (np.positionAt != lastStamp) {
+            lastStamp = np.positionAt
+            stampIsLocal = abs(System.currentTimeMillis() - np.positionAt) < LOCAL_STAMP_WINDOW_MS
+        }
+
         val id: String? = np.mediaId
         val trackChanged = id != _state.value.trackId
         if (trackChanged) {
@@ -142,7 +174,7 @@ class LyricsViewModel(application: Application) : AndroidViewModel(application),
         if (np.durationMs > 0) durationMs = np.durationMs
 
         val now = SystemClock.elapsedRealtime()
-        val target = np.positionAt(System.currentTimeMillis()) + CLOCK_TRIM_MS
+        val target = rawPositionMs()
         val drift = shown - target
         val smooth = old != null && !trackChanged && old.advancing && np.advancing &&
             abs(drift) <= WearSyncPaths.DRIFT_SNAP_THRESHOLD_MS
@@ -160,7 +192,12 @@ class LyricsViewModel(application: Application) : AndroidViewModel(application),
 
     fun setUiVisible(visible: Boolean) {
         uiVisible = visible
-        if (visible) tick()
+        if (visible) {
+            tick()
+            startClockSync()
+        } else {
+            clockJob?.cancel()
+        }
         updateTicker()
     }
 
@@ -191,8 +228,18 @@ class LyricsViewModel(application: Application) : AndroidViewModel(application),
         viewModelScope.launch { handlePayloadDataMap(latest) }
     }
 
+    override fun onMessageReceived(event: MessageEvent) {
+        if (event.path != WearSyncPaths.CLOCK_PONG || event.data.size < 16) return
+        val received = System.currentTimeMillis()
+        val buffer = ByteBuffer.wrap(event.data)
+        val sentAt = buffer.long
+        val phoneAt = buffer.long
+        viewModelScope.launch { recordClockSample(sentAt, phoneAt, received) }
+    }
+
     override fun onCleared() {
         dataClient.removeListener(this)
+        messageClient.removeListener(this)
         super.onCleared()
     }
 
@@ -328,14 +375,74 @@ class LyricsViewModel(application: Application) : AndroidViewModel(application),
     // Clock
     // ---------------------------------------------------------------------------------
 
-    private fun currentPositionMs(): Long {
+    /** The watch's best reading of the phone's playhead right now, before any smoothing. */
+    private fun rawPositionMs(): Long {
         val np = nowPlaying ?: return 0L
-        val base = np.positionAt(System.currentTimeMillis()) + CLOCK_TRIM_MS
+        return positionOf(np, System.currentTimeMillis()) + CLOCK_TRIM_MS
+    }
+
+    /** [np] run on from its stamp to [watchWall], with the stamp read on the watch's own clock. */
+    private fun positionOf(np: NowPlaying, watchWall: Long): Long {
+        if (!np.advancing || np.durationMs <= 0L) return np.positionMs
+        val stampOnWatchClock = if (stampIsLocal) np.positionAt else np.positionAt - clockOffsetMs
+        val ran = ((watchWall - stampOnWatchClock).coerceAtLeast(0L) * np.speed).toLong()
+        return (np.positionMs + ran).coerceAtMost(np.durationMs)
+    }
+
+    private fun currentPositionMs(): Long {
+        val base = rawPositionMs()
         val t = ((SystemClock.elapsedRealtime() - blendStartElapsedMs).toFloat() / BLEND_WINDOW_MS)
             .coerceIn(0f, 1f)
         val blended = base + (blendFromMs * (1f - t)).toLong()
         val max = if (durationMs > 0) durationMs else Long.MAX_VALUE
         return blended.coerceIn(0L, max)
+    }
+
+    /** Keep what is on screen continuous across a change in the clock estimate. */
+    private fun rebaseFrom(displayed: Long) {
+        val d = displayed - rawPositionMs()
+        val smooth = abs(d) <= WearSyncPaths.DRIFT_SNAP_THRESHOLD_MS
+        blendFromMs = if (smooth) d else 0L
+        blendStartElapsedMs = SystemClock.elapsedRealtime()
+        if (!smooth) hapticSuppressUntilElapsedMs = blendStartElapsedMs + HAPTIC_SUPPRESS_AFTER_SNAP_MS
+    }
+
+    /** A short burst of pings when the screen opens, then one a minute while it is on. */
+    private fun startClockSync() {
+        if (clockJob?.isActive == true) return
+        clockJob = viewModelScope.launch {
+            var sent = 0
+            while (isActive) {
+                val nodes = nodeClient.connectedNodes.awaitOrNull().orEmpty()
+                val body = ByteBuffer.allocate(8).putLong(System.currentTimeMillis()).array()
+                nodes.forEach { messageClient.sendMessage(it.id, WearSyncPaths.CLOCK_PING, body).awaitOrNull() }
+                sent++
+                delay(if (sent < CLOCK_BURST) CLOCK_BURST_GAP_MS else CLOCK_REFRESH_MS)
+            }
+        }
+    }
+
+    /**
+     * [sentAt] and [receivedAt] are watch time, [phoneAt] phone time somewhere in between. The
+     * phone's reading is taken to be at the midpoint, and the sample with the shortest round trip
+     * is the one to trust: delay on the way out and delay on the way back are what spoil it.
+     */
+    private fun recordClockSample(sentAt: Long, phoneAt: Long, receivedAt: Long) {
+        val rtt = receivedAt - sentAt
+        if (rtt < 0 || rtt > MAX_CLOCK_RTT_MS) return
+        val now = SystemClock.elapsedRealtime()
+        clockSamples.removeAll { now - it.atElapsedMs > CLOCK_SAMPLE_TTL_MS }
+        clockSamples += ClockSample(offsetMs = phoneAt - (sentAt + rtt / 2), rttMs = rtt, atElapsedMs = now)
+        val best = clockSamples.minBy { it.rttMs }
+        if (best.offsetMs == clockOffsetMs) return
+
+        val displayed = if (nowPlaying != null) currentPositionMs() else 0L
+        clockOffsetMs = best.offsetMs
+        Log.d(TAG, "clock offset ${best.offsetMs} ms (round trip ${best.rttMs} ms)")
+        if (nowPlaying != null) {
+            rebaseFrom(displayed)
+            tick()
+        }
     }
 
     private fun updateTicker() {
@@ -381,9 +488,17 @@ class LyricsViewModel(application: Application) : AndroidViewModel(application),
         const val PAYLOAD_GRACE_MS = 1_500L
         const val HAPTIC_SUPPRESS_AFTER_SNAP_MS = 250L
 
+        /** A stamp this close to "now" at arrival was written on this watch, not by the phone. */
+        const val LOCAL_STAMP_WINDOW_MS = 150L
+        const val CLOCK_BURST = 6
+        const val CLOCK_BURST_GAP_MS = 400L
+        const val CLOCK_REFRESH_MS = 60_000L
+        const val MAX_CLOCK_RTT_MS = 4_000L
+        const val CLOCK_SAMPLE_TTL_MS = 300_000L
+
         /**
-         * Phone and watch clocks are compared through wall time. If lyrics sit consistently early
-         * or late on your watch, nudge this (positive = lyrics appear earlier, negative = later).
+         * Fine adjustment on top of the measured clock offset, for a speaker or earbuds that are
+         * consistently early or late (positive = lyrics appear earlier, negative = later).
          */
         const val CLOCK_TRIM_MS = 0L
     }

@@ -18,6 +18,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
+import java.nio.ByteBuffer
 import java.util.concurrent.TimeUnit
 
 /**
@@ -113,8 +114,18 @@ object WearLyricsSync : MessageClient.OnMessageReceivedListener {
         }
     }
 
-    /** The watch lost (or never had) the lyrics of [trackId]: send them again, whatever the log says. */
+    /**
+     * Watch -> phone:
+     *  - a clock ping: answered at once with this phone's clock, so the watch can tell how far its
+     *    own wall clock is from the one that stamps every playback reading it receives
+     *  - a lyrics request: the watch lost (or never had) the lyrics of a track; send them again,
+     *    whatever the delivered log says
+     */
     override fun onMessageReceived(event: MessageEvent) {
+        if (event.path == WearSyncPaths.CLOCK_PING) {
+            answerClockPing(event)
+            return
+        }
         if (event.path != WearSyncPaths.LYRICS_REQUEST) return
         val requested = String(event.data, Charsets.UTF_8)
         val app = appContext ?: return
@@ -135,6 +146,17 @@ object WearLyricsSync : MessageClient.OnMessageReceivedListener {
     }
 
     // ---------------------------------------------------------------------------------
+
+    private fun answerClockPing(event: MessageEvent) {
+        val app = appContext ?: return
+        val data = event.data
+        if (data.size < 8) return
+        val reply = ByteBuffer.allocate(16)
+            .put(data, 0, 8) // the watch's own send time, echoed back
+            .putLong(System.currentTimeMillis()) // this phone's clock, read as late as possible
+            .array()
+        Wearable.getMessageClient(app).sendMessage(event.sourceNodeId, WearSyncPaths.CLOCK_PONG, reply)
+    }
 
     private fun putPayload(app: Context, payload: SyncedLyricsPayload): Boolean = try {
         val request = PutDataMapRequest.create(WearSyncPaths.LYRICS_PAYLOAD).apply {
