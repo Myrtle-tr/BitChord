@@ -1,6 +1,8 @@
 package com.music.bitchord.wear
 
 import android.content.Context
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import com.google.android.gms.wearable.Asset
 import com.google.android.gms.wearable.MessageClient
@@ -32,8 +34,8 @@ import java.util.concurrent.TimeUnit
  *
  *  - [publish] is called by PlaybackService each time its own lyrics lookup finishes
  *    (track change, settings change). It builds a [SyncedLyricsPayload] and puts it on the Data
- *    Layer as a gzip asset. A (track, content hash) already delivered is not sent again; if the
- *    watch lost its copy it asks, see [onMessageReceived].
+ *    Layer as a gzip asset. The item always holds the latest lyrics; only an identical repeat is
+ *    skipped. If the watch lost its copy it asks, see [onMessageReceived].
  *  - a track with no word- or line-timed lyrics is announced as "none" so the watch can say so.
  *  - lyrics the player picked or synced by hand ([publish] with fromUi) win over the service's own
  *    lookup for that track.
@@ -43,6 +45,15 @@ import java.util.concurrent.TimeUnit
  *  - [start]/[stop] bracket the service's life and register the listener for the watch's request.
  */
 object WearLyricsSync : MessageClient.OnMessageReceivedListener {
+
+    /** Where the phone's player is right now. Read on the main thread, see [playhead]. */
+    class Playhead(val positionMs: Long, val advancing: Boolean, val speed: Float)
+
+    /**
+     * Set by PlaybackService: how to read the active player. A clock ping is answered with it, so
+     * the watch can measure the phone's real position instead of inferring it from stamps.
+     */
+    @Volatile var playhead: (() -> Playhead?)? = null
 
     private const val TAG = "WearLyricsSync"
     private const val TIMEOUT_S = 10L
@@ -68,12 +79,11 @@ object WearLyricsSync : MessageClient.OnMessageReceivedListener {
     private var extraJob: Job? = null
     private var offsetJob: Job? = null
     @Volatile private var appContext: Context? = null
-    @Volatile private var delivered: DeliveredLog? = null
+    @Volatile private var lastPutKey: String? = null
 
     fun start(context: Context) {
         val app = context.applicationContext
         appContext = app
-        if (delivered == null) delivered = DeliveredLog(app)
         if (listening) return
         listening = true
         Wearable.getMessageClient(app).addListener(this)
@@ -86,6 +96,7 @@ object WearLyricsSync : MessageClient.OnMessageReceivedListener {
     fun stop(context: Context) {
         publishJob?.cancel()
         offsetJob?.cancel()
+        playhead = null
         if (!listening) return
         listening = false
         Wearable.getMessageClient(context.applicationContext).removeListener(this)
@@ -108,7 +119,6 @@ object WearLyricsSync : MessageClient.OnMessageReceivedListener {
         if (fromUi) uiTrackId = mediaId else if (uiTrackId == mediaId) return
         val app = context.applicationContext
         appContext = app
-        if (delivered == null) delivered = DeliveredLog(app)
 
         publishJob?.cancel()
         publishJob = scope.launch {
@@ -122,6 +132,7 @@ object WearLyricsSync : MessageClient.OnMessageReceivedListener {
                     currentTrackId = mediaId
                     currentLines = emptyList()
                     currentOrder = IntArray(0)
+                    lastPutKey = "none#$mediaId"
                     putNone(app, mediaId)
                     return@launch
                 }
@@ -143,10 +154,13 @@ object WearLyricsSync : MessageClient.OnMessageReceivedListener {
                     .sortedBy { it.value.timeMs }
                     .map { it.index }
                     .toIntArray()
-                val log = delivered
-                if (log == null || !log.contains(mediaId, payload.contentHash)) {
-                    if (putPayload(app, payload)) log?.add(mediaId, payload.contentHash)
-                }
+                // The Data Layer item is what the watch reads, so it has to hold THIS payload. A source
+                // switched back to one used earlier has the hash of a delivery long ago, while the
+                // item now holds something else, so "delivered before" is the wrong question. Only
+                // an identical repeat (the service and the player both report the same lines) is
+                // skipped; the asset is content-addressed, so bytes the watch has are not re-sent.
+                val key = "$mediaId#${payload.contentHash}"
+                if (key != lastPutKey && putPayload(app, payload)) lastPutKey = key
                 // The watch is showing a translation: these are different lyrics now.
                 val kind = wantedKind
                 if (kind != null && wantedTrack == mediaId) sendExtra(app, mediaId, kind)
@@ -163,7 +177,7 @@ object WearLyricsSync : MessageClient.OnMessageReceivedListener {
      *  - a clock ping: answered at once with this phone's clock, so the watch can tell how far its
      *    own wall clock is from the one that stamps every playback reading it receives
      *  - a lyrics request: the watch lost (or never had) the lyrics of a track; send them again,
-     *    whatever the delivered log says
+     *    whatever was sent before
      */
     override fun onMessageReceived(event: MessageEvent) {
         if (event.path == WearSyncPaths.CLOCK_PING) {
@@ -305,14 +319,31 @@ object WearLyricsSync : MessageClient.OnMessageReceivedListener {
         val app = appContext ?: return
         val data = event.data
         if (data.size < 8) return
-        val reply = ByteBuffer.allocate(16)
-            .put(data, 0, 8) // the watch's own send time, echoed back
-            .putLong(System.currentTimeMillis()) // this phone's clock, read as late as possible
-            .array()
-        Wearable.getMessageClient(app).sendMessage(event.sourceNodeId, WearSyncPaths.CLOCK_PONG, reply)
+        val sentAt = data.copyOfRange(0, 8) // the watch's own send time, echoed back
+        val nodeId = event.sourceNodeId
+
+        // The player may only be touched on the main thread, and the clock and the position have to
+        // be read at the same instant, so both are read there, as late as possible.
+        val reply = Runnable {
+            val head = try {
+                playhead?.invoke()
+            } catch (e: Exception) {
+                null
+            }
+            val body = ByteBuffer.allocate(29)
+                .put(sentAt)
+                .putLong(System.currentTimeMillis())
+                .putLong(head?.positionMs ?: -1L)
+                .put(if (head?.advancing == true) 1.toByte() else 0.toByte())
+                .putFloat(head?.speed ?: 1f)
+                .array()
+            Wearable.getMessageClient(app).sendMessage(nodeId, WearSyncPaths.CLOCK_PONG, body)
+        }
+        if (Looper.myLooper() == Looper.getMainLooper()) reply.run() else Handler(Looper.getMainLooper()).post(reply)
     }
 
     private fun putPayload(app: Context, payload: SyncedLyricsPayload): Boolean = try {
+        lastPutKey = "${payload.trackId}#${payload.contentHash}"
         val request = PutDataMapRequest.create(WearSyncPaths.LYRICS_PAYLOAD).apply {
             dataMap.putString(WearSyncPaths.KEY_TRACK_ID, payload.trackId)
             dataMap.putString(WearSyncPaths.KEY_HASH, payload.contentHash)
@@ -360,32 +391,5 @@ object WearLyricsSync : MessageClient.OnMessageReceivedListener {
             }
         }
         return RawLyricLine(text = text, startMs = timeMs, endMs = sungUntilMs, syllables = parts)
-    }
-
-    /** Persistent, bounded, ordered record of "(track, hash) already pushed to the Data Layer". */
-    private class DeliveredLog(context: Context) {
-        private val prefs = context.getSharedPreferences("wear_lyrics_sync", Context.MODE_PRIVATE)
-        private val entries = ArrayDeque<String>(
-            prefs.getString(KEY, "").orEmpty().split('\n').filter { it.isNotEmpty() },
-        )
-
-        @Synchronized
-        fun contains(trackId: String, hash: String) = entries.contains(key(trackId, hash))
-
-        @Synchronized
-        fun add(trackId: String, hash: String) {
-            val k = key(trackId, hash)
-            entries.remove(k)
-            entries.addLast(k)
-            while (entries.size > MAX) entries.removeFirst()
-            prefs.edit().putString(KEY, entries.joinToString("\n")).apply()
-        }
-
-        private fun key(trackId: String, hash: String) = "${trackId.replace('\n', ' ')}#$hash"
-
-        private companion object {
-            const val KEY = "delivered"
-            const val MAX = 150
-        }
     }
 }

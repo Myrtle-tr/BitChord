@@ -1,6 +1,7 @@
 package com.music.bitchord.wear.ui
 
 import android.app.Application
+import android.content.Context
 import android.net.Uri
 import android.os.SystemClock
 import android.util.Log
@@ -46,6 +47,9 @@ enum class LyricsStatus { IDLE, LOADING, READY, UNAVAILABLE }
 enum class LyricsView { ORIGINAL, TRANSLATION, ROMANIZATION }
 
 enum class ExtraStatus { IDLE, LOADING, READY, SAME, UNAVAILABLE }
+
+/** How well the watch knows where the phone's playhead is: how many fixes, and the best round trip. */
+data class SyncInfo(val fixCount: Int = 0, val bestRttMs: Long = -1L)
 
 data class LyricsUiState(
     val trackId: String? = null,
@@ -101,12 +105,21 @@ class LyricsViewModel(application: Application) : AndroidViewModel(application),
     private val messageClient = Wearable.getMessageClient(application)
     private val nodeClient = Wearable.getNodeClient(application)
     private val cache = LyricsCache(application)
+    private val prefs = application.getSharedPreferences("bitchord_lyrics", Context.MODE_PRIVATE)
 
-    private val _state = MutableStateFlow(LyricsUiState())
+    private val _state = MutableStateFlow(LyricsUiState(viewMode = restoredViewMode()))
     val state: StateFlow<LyricsUiState> = _state.asStateFlow()
 
     private val _positionMs = MutableStateFlow(0L)
     val positionMs: StateFlow<Long> = _positionMs.asStateFlow()
+
+    /**
+     * The user's own fine adjustment, in ms, kept across runs (long-press the lyrics screen).
+     * Positive = lyrics appear earlier, negative = later. It absorbs what cannot be measured:
+     * earbud delay, how far ahead the phone lights a line, the radio's uneven delay.
+     */
+    private val _trimMs = MutableStateFlow(prefs.getInt(KEY_TRIM_MS, 0))
+    val trimMs: StateFlow<Int> = _trimMs.asStateFlow()
 
     private val _events = MutableSharedFlow<LyricsEvent>(
         extraBufferCapacity = 8,
@@ -125,6 +138,20 @@ class LyricsViewModel(application: Application) : AndroidViewModel(application),
 
     /** The player's lyrics offset, mirrored from the phone: the position used is the playhead minus this. */
     private var lyricsOffsetMs = 0
+
+    // --- Fixes on the phone's own playhead (by ping) -----------------------------------
+    private class PhoneHead(val positionMs: Long, val advancing: Boolean, val speed: Float)
+
+    private class Fix(val positionMs: Long, val atWatchWall: Long, val rttMs: Long, val speed: Float)
+
+    private val fixes = ArrayList<Fix>()
+    private val bestFixes = ArrayList<Fix>()
+    private val fixScratch = LongArray(FIX_BEST_COUNT)
+    private var burstLeft = 0
+    private var nextPingAtElapsedMs = 0L
+
+    private val _syncInfo = MutableStateFlow(SyncInfo())
+    val syncInfo: StateFlow<SyncInfo> = _syncInfo.asStateFlow()
 
     // --- Phone <-> watch clock offset ------------------------------------------------
     private class ClockSample(val offsetMs: Long, val rttMs: Long, val atElapsedMs: Long)
@@ -189,6 +216,17 @@ class LyricsViewModel(application: Application) : AndroidViewModel(application),
         }
         if (np.durationMs > 0) durationMs = np.durationMs
 
+        // Fixes describe one unbroken stretch of playback: a new track, a pause, or a jump (a seek)
+        // ends it, and a quick burst of pings measures the new one.
+        if (trackChanged || !np.advancing) {
+            clearFixes()
+        } else if (fixes.isNotEmpty()) {
+            val wall = System.currentTimeMillis()
+            val fixed = fixPositionAt(wall)
+            if (fixed != null && abs(fixed - positionOf(np, wall)) > FIX_CONSISTENCY_MS) clearFixes()
+        }
+        if (np.advancing && fixes.isEmpty()) requestBurst(if (trackChanged) PING_BURST_TRACK else PING_BURST_RESUME)
+
         val now = SystemClock.elapsedRealtime()
         val target = rawPositionMs()
         val drift = shown - target
@@ -210,7 +248,7 @@ class LyricsViewModel(application: Application) : AndroidViewModel(application),
         uiVisible = visible
         if (visible) {
             tick()
-            startClockSync()
+            requestBurst(PING_BURST_OPEN)
         } else {
             clockJob?.cancel()
         }
@@ -225,6 +263,18 @@ class LyricsViewModel(application: Application) : AndroidViewModel(application),
         updateTicker()
     }
 
+    fun nudgeTrim(deltaMs: Int) {
+        val next = (_trimMs.value + deltaMs).coerceIn(-TRIM_LIMIT_MS, TRIM_LIMIT_MS)
+        if (next == _trimMs.value) return
+        val displayed = if (nowPlaying != null) currentPositionMs() else 0L
+        _trimMs.value = next
+        prefs.edit().putInt(KEY_TRIM_MS, next).apply()
+        if (nowPlaying != null) {
+            rebaseFrom(displayed)
+            tick()
+        }
+    }
+
     fun toggleTranslation() = setViewMode(LyricsView.TRANSLATION)
 
     fun toggleRomanization() = setViewMode(LyricsView.ROMANIZATION)
@@ -232,6 +282,7 @@ class LyricsViewModel(application: Application) : AndroidViewModel(application),
     /** Choosing the mode that is already on goes back to the original lyrics. */
     private fun setViewMode(mode: LyricsView) {
         val next = if (_state.value.viewMode == mode) LyricsView.ORIGINAL else mode
+        prefs.edit().putString(KEY_VIEW_MODE, next.name).apply()
         _state.update {
             it.copy(
                 viewMode = next,
@@ -279,7 +330,15 @@ class LyricsViewModel(application: Application) : AndroidViewModel(application),
         val buffer = ByteBuffer.wrap(event.data)
         val sentAt = buffer.long
         val phoneAt = buffer.long
-        viewModelScope.launch { recordClockSample(sentAt, phoneAt, received) }
+        // Newer phones also say where their player is; older ones only send the two times.
+        val head = if (event.data.size >= 29) {
+            val position = buffer.long
+            val advancing = buffer.get().toInt() != 0
+            PhoneHead(position, advancing, buffer.float)
+        } else {
+            null
+        }
+        viewModelScope.launch { recordClockSample(sentAt, phoneAt, received, head) }
     }
 
     override fun onCleared() {
@@ -383,6 +442,11 @@ class LyricsViewModel(application: Application) : AndroidViewModel(application),
         Log.w(TAG, "Could not read lyrics asset", e)
         null
     }
+
+    /** The last choice (original, translation, Latin script) is kept across runs. */
+    private fun restoredViewMode(): LyricsView =
+        runCatching { LyricsView.valueOf(prefs.getString(KEY_VIEW_MODE, null) ?: "ORIGINAL") }
+            .getOrDefault(LyricsView.ORIGINAL)
 
     private fun kindOf(mode: LyricsView): String = when (mode) {
         LyricsView.TRANSLATION -> WearSyncPaths.KIND_TRANSLATION
@@ -504,7 +568,11 @@ class LyricsViewModel(application: Application) : AndroidViewModel(application),
     /** The watch's best reading of the phone's playhead right now, before any smoothing. */
     private fun rawPositionMs(): Long {
         val np = nowPlaying ?: return 0L
-        return positionOf(np, System.currentTimeMillis()) + CLOCK_TRIM_MS - lyricsOffsetMs
+        val wall = System.currentTimeMillis()
+        // A fix on the phone's playhead beats arithmetic on stamps from two different clocks.
+        val base = if (np.advancing) fixPositionAt(wall) ?: positionOf(np, wall) else np.positionMs
+        val max = if (np.durationMs > 0) np.durationMs else Long.MAX_VALUE
+        return base.coerceAtMost(max) + _trimMs.value - lyricsOffsetMs
     }
 
     /** [np] run on from its stamp to [watchWall], with the stamp read on the watch's own clock. */
@@ -533,19 +601,63 @@ class LyricsViewModel(application: Application) : AndroidViewModel(application),
         if (!smooth) hapticSuppressUntilElapsedMs = blendStartElapsedMs + HAPTIC_SUPPRESS_AFTER_SNAP_MS
     }
 
-    /** A short burst of pings when the screen opens, then one a minute while it is on. */
-    private fun startClockSync() {
+    /** [count] quick pings from now on (a longer burst already queued is kept). */
+    private fun requestBurst(count: Int) {
+        burstLeft = maxOf(burstLeft, count)
+        nextPingAtElapsedMs = 0L
+        startPinging()
+    }
+
+    /**
+     * Pings the phone: a quick burst when the screen opens, the track changes or playback resumes,
+     * then one every [PING_REFRESH_MS] while playing. Each answer is a fresh fix on the phone's playhead.
+     */
+    private fun startPinging() {
         if (clockJob?.isActive == true) return
         clockJob = viewModelScope.launch {
-            var sent = 0
             while (isActive) {
-                val nodes = nodeClient.connectedNodes.awaitOrNull().orEmpty()
-                val body = ByteBuffer.allocate(8).putLong(System.currentTimeMillis()).array()
-                nodes.forEach { messageClient.sendMessage(it.id, WearSyncPaths.CLOCK_PING, body).awaitOrNull() }
-                sent++
-                delay(if (sent < CLOCK_BURST) CLOCK_BURST_GAP_MS else CLOCK_REFRESH_MS)
+                val now = SystemClock.elapsedRealtime()
+                if (now >= nextPingAtElapsedMs) {
+                    val burst = burstLeft > 0
+                    if (burst || playing) sendPing()
+                    if (burst) burstLeft--
+                    nextPingAtElapsedMs = now + if (burstLeft > 0) PING_GAP_MS else PING_REFRESH_MS
+                }
+                delay(PING_POLL_MS)
             }
         }
+    }
+
+    private suspend fun sendPing() {
+        val nodes = nodeClient.connectedNodes.awaitOrNull().orEmpty()
+        if (nodes.isEmpty()) return
+        val body = ByteBuffer.allocate(8).putLong(System.currentTimeMillis()).array()
+        nodes.forEach { messageClient.sendMessage(it.id, WearSyncPaths.CLOCK_PING, body).awaitOrNull() }
+    }
+
+    private fun clearFixes() {
+        fixes.clear()
+        bestFixes.clear()
+        _syncInfo.value = SyncInfo()
+    }
+
+    /** The few fixes with the shortest round trip are the ones to trust. */
+    private fun refreshBestFixes() {
+        bestFixes.clear()
+        fixes.sortedBy { it.rttMs }.take(FIX_BEST_COUNT).forEach { bestFixes += it }
+        _syncInfo.value = SyncInfo(fixes.size, bestFixes.firstOrNull()?.rttMs ?: -1L)
+    }
+
+    /** Each good fix run on to [watchWall]; their median, so one odd answer cannot move the lyrics. */
+    private fun fixPositionAt(watchWall: Long): Long? {
+        val n = bestFixes.size
+        if (n == 0) return null
+        for (i in 0 until n) {
+            val f = bestFixes[i]
+            fixScratch[i] = f.positionMs + ((watchWall - f.atWatchWall) * f.speed).toLong()
+        }
+        java.util.Arrays.sort(fixScratch, 0, n)
+        return fixScratch[n / 2]
     }
 
     /**
@@ -553,19 +665,40 @@ class LyricsViewModel(application: Application) : AndroidViewModel(application),
      * phone's reading is taken to be at the midpoint, and the sample with the shortest round trip
      * is the one to trust: delay on the way out and delay on the way back are what spoil it.
      */
-    private fun recordClockSample(sentAt: Long, phoneAt: Long, receivedAt: Long) {
+    private fun recordClockSample(sentAt: Long, phoneAt: Long, receivedAt: Long, head: PhoneHead?) {
         val rtt = receivedAt - sentAt
         if (rtt < 0 || rtt > MAX_CLOCK_RTT_MS) return
+        val displayed = if (nowPlaying != null) currentPositionMs() else 0L
+        var changed = false
+
+        // 1. The offset between the two wall clocks: the fallback until a fix exists, and what
+        //    reads the phone's stamps on the watch's clock.
         val now = SystemClock.elapsedRealtime()
         clockSamples.removeAll { now - it.atElapsedMs > CLOCK_SAMPLE_TTL_MS }
         clockSamples += ClockSample(offsetMs = phoneAt - (sentAt + rtt / 2), rttMs = rtt, atElapsedMs = now)
         val best = clockSamples.minBy { it.rttMs }
-        if (best.offsetMs == clockOffsetMs) return
+        if (best.offsetMs != clockOffsetMs) {
+            clockOffsetMs = best.offsetMs
+            Log.d(TAG, "clock offset ${best.offsetMs} ms (round trip ${best.rttMs} ms)")
+            changed = true
+        }
 
-        val displayed = if (nowPlaying != null) currentPositionMs() else 0L
-        clockOffsetMs = best.offsetMs
-        Log.d(TAG, "clock offset ${best.offsetMs} ms (round trip ${best.rttMs} ms)")
-        if (nowPlaying != null) {
+        // 2. A fix on the phone's playhead itself, taken at the middle of the round trip.
+        val np = nowPlaying
+        if (head != null && head.positionMs >= 0 && head.advancing && np != null && np.advancing) {
+            val at = sentAt + rtt / 2
+            // An answer that disagrees with what is held means a seek or a stall: start over from it.
+            val held = fixPositionAt(at)
+            if (held != null && abs(held - head.positionMs) > FIX_CONSISTENCY_MS) fixes.clear()
+            fixes += Fix(head.positionMs, at, rtt, head.speed)
+            val wall = System.currentTimeMillis()
+            fixes.removeAll { wall - it.atWatchWall > FIX_TTL_MS }
+            while (fixes.size > MAX_FIXES) fixes.removeAt(0)
+            refreshBestFixes()
+            changed = true
+        }
+
+        if (changed && np != null) {
             rebaseFrom(displayed)
             tick()
         }
@@ -617,16 +750,21 @@ class LyricsViewModel(application: Application) : AndroidViewModel(application),
 
         /** A stamp this close to "now" at arrival was written on this watch, not by the phone. */
         const val LOCAL_STAMP_WINDOW_MS = 150L
-        const val CLOCK_BURST = 6
-        const val CLOCK_BURST_GAP_MS = 400L
-        const val CLOCK_REFRESH_MS = 60_000L
+        const val PING_BURST_OPEN = 8
+        const val PING_BURST_TRACK = 6
+        const val PING_BURST_RESUME = 4
+        const val PING_GAP_MS = 450L
+        const val PING_REFRESH_MS = 15_000L
+        const val PING_POLL_MS = 150L
+        const val FIX_TTL_MS = 90_000L
+        const val FIX_BEST_COUNT = 5
+        const val MAX_FIXES = 16
+        const val FIX_CONSISTENCY_MS = 800L
+        const val KEY_VIEW_MODE = "view_mode"
         const val MAX_CLOCK_RTT_MS = 4_000L
         const val CLOCK_SAMPLE_TTL_MS = 300_000L
 
-        /**
-         * Fine adjustment on top of the measured clock offset, for a speaker or earbuds that are
-         * consistently early or late (positive = lyrics appear earlier, negative = later).
-         */
-        const val CLOCK_TRIM_MS = 0L
+        const val KEY_TRIM_MS = "trim_ms"
+        const val TRIM_LIMIT_MS = 3_000
     }
 }
