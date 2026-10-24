@@ -10,6 +10,26 @@ object WearSyncPaths {
     const val PLAYBACK_COMMAND = "/bitchord/playback/command"
     const val LYRICS_REQUEST = "/bitchord/lyrics/request"
 
+    /** Phone -> watch (DataClient): the player's lyrics offset in ms; positive = lyrics later. */
+    const val LYRICS_OFFSET = "/bitchord/lyrics/offset"
+    const val KEY_OFFSET_MS = "offsetMs"
+
+    /** Watch -> phone: "trackId\nmode", mode = translation | romanization | original. */
+    const val LYRICS_TRANSFORM = "/bitchord/lyrics/transform"
+
+    /** Phone -> watch (DataClient): per-line translated or romanized text, aligned to the payload's lines. */
+    const val LYRICS_EXTRA = "/bitchord/lyrics/extra"
+    const val KEY_KIND = "kind"
+    const val KEY_STATUS = "status"
+    const val KEY_LANG = "lang"
+    const val KEY_TEXTS = "texts"
+    const val KIND_TRANSLATION = "translation"
+    const val KIND_ROMANIZATION = "romanization"
+    const val KIND_ORIGINAL = "original"
+    const val STATUS_OK = "ok"
+    const val STATUS_SAME = "same"
+    const val STATUS_UNAVAILABLE = "unavailable"
+
     /** Watch -> phone: its send time. Phone -> watch: that time echoed, then the phone's clock. */
     const val CLOCK_PING = "/bitchord/lyrics/clock/ping"
     const val CLOCK_PONG = "/bitchord/lyrics/clock/pong"

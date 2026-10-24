@@ -1269,6 +1269,9 @@ class PlaybackService : MediaLibraryService() {
     override fun onCreate() {
         super.onCreate()
         WearLyricsSync.start(applicationContext)
+        WearLyricsSync.playhead = {
+            player?.let { WearLyricsSync.Playhead(it.currentPosition, it.isPlaying, it.playbackParameters.speed) }
+        }
 
         if (com.music.bitchord.data.innertube.Innertube.cookie == null) {
             com.music.bitchord.data.innertube.Innertube.cookie = com.music.bitchord.auth.AuthStore(this).cookie

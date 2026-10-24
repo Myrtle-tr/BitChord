@@ -50,6 +50,9 @@ private const val SYLLABLE_PULSE_SCALE = 1.025f
  * line recomposes per frame; inactive lines are skipped entirely.
  *
  * @param isActive  the line currently being sung
+ * @param altText   the phone's translation or Latin-script reading of this line, or null for the
+ *                  original. It has no timing of its own: the sweep follows how much of the
+ *                  ORIGINAL line has been sung, projected onto the new text (what the phone does).
  * @param ambient   simplified styling for always-on display (no animation, no accent, no glow)
  */
 @Composable
@@ -58,9 +61,11 @@ fun LyricLineItem(
     isActive: Boolean,
     positionState: State<Long>,
     modifier: Modifier = Modifier,
+    altText: String? = null,
     ambient: Boolean = false,
 ) {
     val highlight = isActive && !ambient
+    val alternative = altText?.takeIf { it.isNotBlank() }
 
     val scale by animateFloatAsState(
         targetValue = if (highlight) ACTIVE_SCALE else 1f,
@@ -92,10 +97,11 @@ fun LyricLineItem(
         }
     }
 
-    val text: AnnotatedString = if (highlight && line.syllables.isNotEmpty()) {
-        buildSyllableText(line, positionMs, syllableIndex)
-    } else {
-        AnnotatedString(line.text)
+    val text: AnnotatedString = when {
+        highlight && alternative != null -> buildSweepText(alternative, sungFraction(line, positionMs))
+        highlight && line.syllables.isNotEmpty() -> buildSyllableText(line, positionMs, syllableIndex)
+        alternative != null -> AnnotatedString(alternative)
+        else -> AnnotatedString(line.text)
     }
 
     Text(
@@ -151,3 +157,26 @@ private fun buildSyllableText(line: SyncedLine, positionMs: Long, activeIndex: I
         }
         if (cursor < full.length) append(full.substring(cursor))
     }
+
+/** How much of the ORIGINAL line has been sung at [positionMs], weighted by characters. */
+private fun sungFraction(line: SyncedLine, positionMs: Long): Float {
+    var total = 0f
+    var sung = 0f
+    for (s in line.syllables) {
+        val length = (s.charEnd - s.charStart).coerceAtLeast(0).toFloat()
+        total += length
+        sung += when {
+            positionMs >= s.endMs -> length
+            positionMs <= s.startMs -> 0f
+            else -> length * ((positionMs - s.startMs).toFloat() / s.durationMs)
+        }
+    }
+    return if (total <= 0f) 0f else (sung / total).coerceIn(0f, 1f)
+}
+
+/** The translated text filled with the accent as far as the original has been sung. */
+private fun buildSweepText(text: String, fraction: Float): AnnotatedString = buildAnnotatedString {
+    val split = (text.length * fraction).toInt().coerceIn(0, text.length)
+    if (split > 0) withStyle(SpanStyle(color = LyricsPalette.Cyan)) { append(text.substring(0, split)) }
+    if (split < text.length) withStyle(SpanStyle(color = LyricsPalette.Upcoming)) { append(text.substring(split)) }
+}

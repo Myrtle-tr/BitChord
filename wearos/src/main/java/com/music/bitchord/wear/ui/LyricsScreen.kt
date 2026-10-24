@@ -9,6 +9,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.focusable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -20,6 +21,8 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -34,11 +37,13 @@ import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.rotary.onRotaryScrollEvent
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.res.stringResource
@@ -66,14 +71,19 @@ import kotlin.math.abs
 private const val IDLE_SNAPBACK_MS = 4_000L
 private const val CONTROLS_HIDE_MS = 4_000L
 private val SwipeThreshold = 64.dp
+private const val TRIM_STEP_MS = 50
+private const val KEEP_AWAKE_PAUSE_LIMIT_MS = 30_000L
 
 /**
  * Synced lyrics, on the phone player's mesh.
  *
  *  - crown: scrolls the lyrics; 4 s after the last touch the list returns to the sung line
  *  - swipe left: next track (swipe right stays the system "back" gesture of the nav host)
- *  - touch controls at the foot, fading out after 4 s
+ *  - touch controls at the foot, fading out after 4 s: translate and Latin-script reading on
+ *    either side of previous / play / next
  *  - haptic tick on a new line, firmer tick on entering a chorus
+ *  - long-press: a small panel to nudge the lyrics earlier or later (kept), keep the screen on
+ *    for this song, how well the automatic sync is doing, and the app version
  *  - always-on display: the app's own AmbientPlayer covers this screen, the clock drops to 1 Hz
  *  - playback state comes from the app's NowPlaying stream; transport buttons use PhoneLink's own commands
  */
@@ -90,6 +100,8 @@ fun LyricsScreen(
     val state by viewModel.state.collectAsStateWithLifecycle()
     val positionState = viewModel.positionMs.collectAsStateWithLifecycle()
     val ambient = LocalAmbient.current
+    val trimMs by viewModel.trimMs.collectAsStateWithLifecycle()
+    val syncInfo by viewModel.syncInfo.collectAsStateWithLifecycle()
 
     // The clock only runs while this screen is on.
     val lifecycleOwner = LocalLifecycleOwner.current
@@ -140,6 +152,11 @@ fun LyricsScreen(
             onPrevious = onPrevious,
             onNext = onNext,
             onTogglePlay = onTogglePlay,
+            trimMs = trimMs,
+            syncInfo = syncInfo,
+            onTrim = viewModel::nudgeTrim,
+            onTranslate = viewModel::toggleTranslation,
+            onRomanize = viewModel::toggleRomanization,
             onRetry = viewModel::requestLyrics,
         )
     }
@@ -157,9 +174,34 @@ private fun LyricsBody(
     onPrevious: () -> Unit,
     onNext: () -> Unit,
     onTogglePlay: () -> Unit,
+    trimMs: Int,
+    syncInfo: SyncInfo,
+    onTrim: (Int) -> Unit,
+    onTranslate: () -> Unit,
+    onRomanize: () -> Unit,
     onRetry: () -> Unit,
 ) {
     val view = LocalView.current
+    val context = LocalContext.current
+    val versionName = remember {
+        runCatching { context.packageManager.getPackageInfo(context.packageName, 0).versionName }.getOrNull().orEmpty()
+    }
+    var showTune by remember { mutableStateOf(false) }
+    var tuneStamp by remember { mutableLongStateOf(0L) }
+
+    // "Keep the screen on": until the song changes, the screen is left, or the song has been paused
+    // for a while. The window flag also keeps the watch out of the always-on mode meanwhile.
+    var keepAwake by remember(state.trackId) { mutableStateOf(false) }
+    DisposableEffect(keepAwake) {
+        view.keepScreenOn = keepAwake
+        onDispose { view.keepScreenOn = false }
+    }
+    LaunchedEffect(keepAwake, isPlaying) {
+        if (keepAwake && !isPlaying) {
+            delay(KEEP_AWAKE_PAUSE_LIMIT_MS)
+            keepAwake = false
+        }
+    }
     val listState = rememberScalingLazyListState()
     val swipeThresholdPx = with(LocalDensity.current) { SwipeThreshold.toPx() }
 
@@ -181,6 +223,14 @@ private fun LyricsBody(
     }
 
     val onNextState by rememberUpdatedState(onNext)
+
+    // The tuning panel closes itself after 5 s without a tap.
+    LaunchedEffect(tuneStamp) {
+        if (showTune) {
+            delay(5_000L)
+            showTune = false
+        }
+    }
 
     // 4 s without crown or touch input: back to the line being sung.
     LaunchedEffect(interactionStamp) {
@@ -224,6 +274,16 @@ private fun LyricsBody(
     Box(
         Modifier
             .fillMaxSize()
+            // Long press: the sync panel. A drag or a swipe cancels it, so scrolling is unaffected.
+            .pointerInput(Unit) {
+                detectTapGestures(
+                    onLongPress = {
+                        view.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+                        showTune = true
+                        tuneStamp = SystemClock.elapsedRealtime()
+                    },
+                )
+            }
             // Any touch wakes the controls. Observed in the Initial pass and never consumed.
             .pointerInput(Unit) {
                 awaitEachGesture {
@@ -274,13 +334,22 @@ private fun LyricsBody(
                 contentPadding = PaddingValues(horizontal = 8.dp),
             ) {
                 item(key = "header") {
-                    TrackHeader(title = state.title, artist = state.artist)
+                    TrackHeader(
+                        title = state.title,
+                        artist = state.artist,
+                        note = extraNote(state),
+                    )
                 }
                 items(count = lines.size, key = { lines[it].index }) { i ->
                     LyricLineItem(
                         line = lines[i],
                         isActive = i == state.activeLineIndex,
                         positionState = positionState,
+                        altText = if (state.viewMode != LyricsView.ORIGINAL && state.extraStatus == ExtraStatus.READY) {
+                            state.extraTexts.getOrNull(i)
+                        } else {
+                            null
+                        },
                         modifier = Modifier.padding(horizontal = 20.dp),
                     )
                 }
@@ -299,7 +368,7 @@ private fun LyricsBody(
             Modifier
                 .align(Alignment.BottomCenter)
                 .fillMaxWidth()
-                .height(h * 0.30f)
+                .height(h * 0.36f)
                 .background(Brush.verticalGradient(listOf(Color.Transparent, Color.Black.copy(alpha = 0.9f)))),
         )
 
@@ -308,27 +377,62 @@ private fun LyricsBody(
             animationSpec = tween(durationMillis = 400),
             label = "lyricsControlsAlpha",
         )
+        if (showTune) {
+            TunePanel(
+                trimMs = trimMs,
+                syncInfo = syncInfo,
+                keepAwake = keepAwake,
+                onKeepAwake = {
+                    keepAwake = !keepAwake
+                    tuneStamp = SystemClock.elapsedRealtime()
+                },
+                versionName = versionName,
+                onLater = {
+                    onTrim(-TRIM_STEP_MS)
+                    tuneStamp = SystemClock.elapsedRealtime()
+                },
+                onEarlier = {
+                    onTrim(TRIM_STEP_MS)
+                    tuneStamp = SystemClock.elapsedRealtime()
+                },
+                modifier = Modifier.align(Alignment.Center),
+            )
+        }
+
+        // Five buttons need a wider chord of the round screen than three did, so the row sits a
+        // little higher: translate | previous | play | next | Latin-script reading.
         Row(
             modifier = Modifier
                 .align(Alignment.BottomCenter)
-                .padding(bottom = h * 0.07f)
+                .padding(bottom = h * 0.10f)
                 .alpha(controlsAlpha),
-            horizontalArrangement = Arrangement.spacedBy(w * 0.03f),
+            horizontalArrangement = Arrangement.spacedBy(w * 0.02f),
             verticalAlignment = Alignment.CenterVertically,
         ) {
+            val translating = state.viewMode == LyricsView.TRANSLATION
+            val romanizing = state.viewMode == LyricsView.ROMANIZATION
+            GlyphButton(
+                icon = R.drawable.ic_lyrics_translate,
+                description = stringResource(R.string.wear_lyrics_translate),
+                size = w * 0.125f,
+                iconSize = w * 0.07f,
+                tint = if (translating) Color.Black else Color.White,
+                background = if (translating) LyricsPalette.Cyan else Color.White.copy(alpha = 0.14f),
+                onClick = onTranslate,
+            )
             GlyphButton(
                 icon = R.drawable.ic_previous,
                 description = stringResource(R.string.previous),
-                size = w * 0.17f,
-                iconSize = w * 0.09f,
+                size = w * 0.14f,
+                iconSize = w * 0.075f,
                 background = Color.White.copy(alpha = 0.14f),
                 onClick = onPrevious,
             )
             GlyphButton(
                 icon = if (isPlaying) R.drawable.ic_pause else R.drawable.ic_play,
                 description = stringResource(if (isPlaying) R.string.pause else R.string.play),
-                size = w * 0.21f,
-                iconSize = w * 0.11f,
+                size = w * 0.17f,
+                iconSize = w * 0.09f,
                 tint = Color.Black,
                 background = Color.White,
                 onClick = onTogglePlay,
@@ -336,18 +440,119 @@ private fun LyricsBody(
             GlyphButton(
                 icon = R.drawable.ic_next,
                 description = stringResource(R.string.next),
-                size = w * 0.17f,
-                iconSize = w * 0.09f,
+                size = w * 0.14f,
+                iconSize = w * 0.075f,
                 enabled = hasNext,
                 background = Color.White.copy(alpha = 0.14f),
                 onClick = onNext,
+            )
+            GlyphButton(
+                icon = R.drawable.ic_lyrics_romanize,
+                description = stringResource(R.string.wear_lyrics_romanize),
+                size = w * 0.125f,
+                iconSize = w * 0.07f,
+                tint = if (romanizing) Color.Black else Color.White,
+                background = if (romanizing) LyricsPalette.Cyan else Color.White.copy(alpha = 0.14f),
+                onClick = onRomanize,
             )
         }
     }
 }
 
+/** Long-press panel: nudge the lyrics by 50 ms steps. The value is kept across runs. */
 @Composable
-private fun TrackHeader(title: String, artist: String) {
+private fun TunePanel(
+    trimMs: Int,
+    syncInfo: SyncInfo,
+    keepAwake: Boolean,
+    onKeepAwake: () -> Unit,
+    versionName: String,
+    onLater: () -> Unit,
+    onEarlier: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Column(
+        modifier = modifier
+            .clip(RoundedCornerShape(24.dp))
+            .background(Color.Black.copy(alpha = 0.9f))
+            .padding(horizontal = 14.dp, vertical = 10.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(5.dp),
+    ) {
+        Text(
+            text = stringResource(R.string.wear_lyrics_tune_title),
+            style = WearType.caption,
+            color = Color.White.copy(alpha = 0.7f),
+        )
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            TuneButton(label = stringResource(R.string.wear_lyrics_later), onClick = onLater)
+            Text(
+                text = (if (trimMs > 0) "+" else "") + "$trimMs ms",
+                style = WearType.row,
+                color = LyricsPalette.Cyan,
+            )
+            TuneButton(label = stringResource(R.string.wear_lyrics_earlier), onClick = onEarlier)
+        }
+        Box(
+            Modifier
+                .clip(CircleShape)
+                .background(if (keepAwake) LyricsPalette.Cyan else Color.White.copy(alpha = 0.16f))
+                .clickable(onClick = onKeepAwake)
+                .padding(horizontal = 12.dp, vertical = 6.dp),
+        ) {
+            Text(
+                text = stringResource(
+                    if (keepAwake) R.string.wear_lyrics_keep_awake_on else R.string.wear_lyrics_keep_awake,
+                ),
+                style = WearType.caption,
+                color = if (keepAwake) Color.Black else Color.White,
+            )
+        }
+        Text(
+            text = if (syncInfo.fixCount > 0) {
+                stringResource(R.string.wear_lyrics_auto_sync) + ": ${syncInfo.fixCount} • ${syncInfo.bestRttMs} ms"
+            } else {
+                stringResource(R.string.wear_lyrics_auto_sync_waiting)
+            },
+            style = WearType.caption,
+            color = Color.White.copy(alpha = 0.5f),
+        )
+        if (versionName.isNotEmpty()) {
+            Text(text = "v$versionName", style = WearType.caption, color = Color.White.copy(alpha = 0.4f))
+        }
+    }
+}
+
+@Composable
+private fun TuneButton(label: String, onClick: () -> Unit) {
+    Box(
+        Modifier
+            .clip(CircleShape)
+            .background(Color.White.copy(alpha = 0.16f))
+            .clickable(onClick = onClick)
+            .padding(horizontal = 12.dp, vertical = 8.dp),
+    ) {
+        Text(text = label, style = WearType.button, color = Color.White)
+    }
+}
+
+/** What to tell the user while a translation or reading is not on screen (yet). */
+@Composable
+private fun extraNote(state: LyricsUiState): String? {
+    if (state.viewMode == LyricsView.ORIGINAL) return null
+    return when (state.extraStatus) {
+        ExtraStatus.LOADING -> stringResource(R.string.wear_lyrics_extra_loading)
+        ExtraStatus.SAME -> stringResource(R.string.wear_lyrics_extra_same)
+        ExtraStatus.UNAVAILABLE -> stringResource(R.string.wear_lyrics_extra_unavailable)
+        ExtraStatus.READY, ExtraStatus.IDLE -> null
+    }
+}
+
+@Composable
+private fun TrackHeader(title: String, artist: String, note: String?) {
     Column(
         horizontalAlignment = Alignment.CenterHorizontally,
         modifier = Modifier.padding(horizontal = 40.dp, vertical = 8.dp),
@@ -368,6 +573,16 @@ private fun TrackHeader(title: String, artist: String) {
             overflow = TextOverflow.Ellipsis,
             textAlign = TextAlign.Center,
         )
+        if (note != null) {
+            Text(
+                text = note,
+                style = WearType.caption,
+                color = Color.White.copy(alpha = 0.6f),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                textAlign = TextAlign.Center,
+            )
+        }
     }
 }
 
