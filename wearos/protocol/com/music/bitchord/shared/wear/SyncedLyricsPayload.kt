@@ -43,6 +43,14 @@ data class SyncedLine(
     val endMs: Long,
     val syllables: List<SyncedSyllable>,
     val isChorus: Boolean,
+    /** An instrumental stretch (no text): drawn as the three dots, [startMs]..[endMs]. */
+    val isGap: Boolean = false,
+    /** Index of this line in the list the phone got from its lyrics source; -1 for an invented gap. */
+    val sourceIndex: Int = -1,
+    /** The answering vocal sung under this line, if any: shown small, on its own clock. */
+    val bgText: String? = null,
+    val bgStartMs: Long = 0L,
+    val bgEndMs: Long = 0L,
 ) {
     /** Index of the last syllable whose start <= [positionMs], or -1 if none has started. */
     fun syllableIndexAt(positionMs: Long): Int {
@@ -64,7 +72,12 @@ data class SyncedLine(
     internal fun toJson(): JSONObject = JSONObject()
         .put("i", index).put("x", text).put("s", startMs).put("e", endMs)
         .put("c", isChorus)
+        .put("g", isGap)
+        .put("o", sourceIndex)
         .put("y", JSONArray().also { arr -> syllables.forEach { arr.put(it.toJson()) } })
+        .also {
+            if (bgText != null) it.put("bt", bgText).put("bs", bgStartMs).put("be", bgEndMs)
+        }
 
     internal companion object {
         fun fromJson(o: JSONObject): SyncedLine {
@@ -76,6 +89,11 @@ data class SyncedLine(
                 endMs = o.getLong("e"),
                 syllables = List(arr.length()) { SyncedSyllable.fromJson(arr.getJSONObject(it)) },
                 isChorus = o.optBoolean("c", false),
+                isGap = o.optBoolean("g", false),
+                sourceIndex = o.optInt("o", -1),
+                bgText = o.optString("bt", "").ifEmpty { null },
+                bgStartMs = o.optLong("bs", 0L),
+                bgEndMs = o.optLong("be", 0L),
             )
         }
     }
@@ -84,11 +102,17 @@ data class SyncedLine(
 /** Plain, source-agnostic input for [SyncedLyricsPayload.build]. Map `LyricLine` onto this. */
 data class RawSyllable(val text: String, val startMs: Long, val endMs: Long)
 
+data class RawBackground(val text: String, val startMs: Long, val endMs: Long)
+
 data class RawLyricLine(
     val text: String,
     val startMs: Long,
     val endMs: Long?,
     val syllables: List<RawSyllable>,
+    /** Blank text is an instrumental stretch (LRC files mark those with a bare timestamp). */
+    val isGap: Boolean = false,
+    val sourceIndex: Int = -1,
+    val background: RawBackground? = null,
 )
 
 /**
@@ -172,28 +196,56 @@ data class SyncedLyricsPayload(
             durationMs: Long,
             raw: List<RawLyricLine>,
         ): SyncedLyricsPayload {
-            val sorted = raw.filter { it.text.isNotBlank() }.sortedBy { it.startMs }
+            val sorted = raw.sortedBy { it.startMs }
 
-            val lines = sorted.mapIndexed { i, r ->
+            val converted = sorted.mapIndexed { i, r ->
                 val text = r.text.trim()
                 val nextStart = sorted.getOrNull(i + 1)?.startMs
                 val fallbackEnd = if (durationMs > r.startMs) durationMs else r.startMs + DEFAULT_LINE_MS
                 val end = (r.endMs ?: nextStart ?: fallbackEnd).coerceAtLeast(r.startMs + 1)
 
-                val syllables = if (r.syllables.any { it.text.isNotBlank() }) {
-                    mapSyllables(text, r.syllables)
+                if (r.isGap || text.isEmpty()) {
+                    SyncedLine(
+                        index = 0, text = "", startMs = r.startMs,
+                        endMs = (nextStart ?: end).coerceAtLeast(r.startMs + 1),
+                        syllables = emptyList(), isChorus = false, isGap = true, sourceIndex = r.sourceIndex,
+                    )
                 } else {
-                    fallbackSyllables(text, r.startMs, end)
+                    val syllables = if (r.syllables.any { it.text.isNotBlank() }) {
+                        mapSyllables(text, r.syllables)
+                    } else {
+                        fallbackSyllables(text, r.startMs, end)
+                    }
+                    val bg = r.background?.takeIf { it.text.isNotBlank() }
+                    SyncedLine(
+                        index = 0, text = text, startMs = r.startMs, endMs = end,
+                        syllables = syllables, isChorus = false, sourceIndex = r.sourceIndex,
+                        bgText = bg?.text?.trim(),
+                        bgStartMs = bg?.startMs ?: 0L,
+                        bgEndMs = bg?.let { maxOf(it.endMs, it.startMs + MIN_BG_MS) } ?: 0L,
+                    )
                 }
-                SyncedLine(
-                    index = i,
-                    text = text,
-                    startMs = r.startMs,
-                    endMs = end,
-                    syllables = syllables,
-                    isChorus = false,
-                )
             }
+
+            // Gaps worth a countdown: the ones the source marks, and the ones its line ends reveal.
+            val withGaps = ArrayList<SyncedLine>()
+            val firstReal = converted.firstOrNull { !it.isGap }
+            if (firstReal != null && converted.first() === firstReal && firstReal.startMs >= INTRO_GAP_MIN_MS) {
+                withGaps += gapLine(0L, firstReal.startMs, -1)
+            }
+            converted.forEachIndexed { i, line ->
+                if (line.isGap) {
+                    if (line.endMs - line.startMs >= GAP_MIN_MS) withGaps += line
+                    return@forEachIndexed
+                }
+                withGaps += line
+                val next = converted.getOrNull(i + 1)
+                if (next != null && !next.isGap) {
+                    val from = line.endMs + GAP_LEAD_MS
+                    if (next.startMs - from >= GAP_MIN_MS) withGaps += gapLine(from, next.startMs, -1)
+                }
+            }
+            val lines = withGaps.mapIndexed { i, l -> l.copy(index = i) }
 
             val marked = markChoruses(lines)
             return SyncedLyricsPayload(
@@ -205,6 +257,11 @@ data class SyncedLyricsPayload(
                 contentHash = hashOf(marked),
             )
         }
+
+        private fun gapLine(start: Long, end: Long, sourceIndex: Int) = SyncedLine(
+            index = 0, text = "", startMs = start, endMs = end, syllables = emptyList(),
+            isChorus = false, isGap = true, sourceIndex = sourceIndex,
+        )
 
         private fun mapSyllables(text: String, raw: List<RawSyllable>): List<SyncedSyllable> {
             var cursor = 0
@@ -243,10 +300,10 @@ data class SyncedLyricsPayload(
 
         private fun markChoruses(lines: List<SyncedLine>): List<SyncedLine> {
             val counts = HashMap<String, Int>()
-            lines.forEach { counts.merge(normalise(it.text), 1, Int::plus) }
+            lines.filter { !it.isGap }.forEach { counts.merge(normalise(it.text), 1, Int::plus) }
             return lines.map {
                 val key = normalise(it.text)
-                it.copy(isChorus = key.length >= MIN_CHORUS_CHARS && (counts[key] ?: 0) >= 2)
+                it.copy(isChorus = !it.isGap && key.length >= MIN_CHORUS_CHARS && (counts[key] ?: 0) >= 2)
             }
         }
 
@@ -261,5 +318,11 @@ data class SyncedLyricsPayload(
 
         private const val DEFAULT_LINE_MS = 4_000L
         private const val MIN_CHORUS_CHARS = 6
+
+        /** A silence shorter than this is not worth a countdown. */
+        private const val GAP_MIN_MS = 5_000L
+        private const val INTRO_GAP_MIN_MS = 4_000L
+        private const val GAP_LEAD_MS = 300L
+        private const val MIN_BG_MS = 1_200L
     }
 }

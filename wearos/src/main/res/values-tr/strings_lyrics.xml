@@ -14,6 +14,13 @@
     <string name="wear_lyrics_tune_title">Senkron</string>
     <string name="wear_lyrics_later">Geç</string>
     <string name="wear_lyrics_earlier">Erken</string>
+    <string name="wear_lyrics_close">Kapat</string>
+    <string name="wear_lyrics_source">Söz kaynağı</string>
+    <string name="wear_lyrics_source_back">Geri</string>
+    <string name="wear_lyrics_source_searching">Aranıyor…</string>
+    <string name="wear_lyrics_source_none">Bu şarkı için senkronlu söz kaynağı yok</string>
+    <string name="wear_lyrics_source_word">Kelime kelime</string>
+    <string name="wear_lyrics_source_line">Satır satır</string>
     <string name="wear_lyrics_keep_awake">Ekran açık kalsın</string>
     <string name="wear_lyrics_keep_awake_on">Ekran açık kalıyor</string>
     <string name="wear_lyrics_auto_sync">Otomatik senkron</string>

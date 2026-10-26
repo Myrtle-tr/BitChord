@@ -39,6 +39,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.tasks.await
 import kotlinx.coroutines.withContext
 import java.nio.ByteBuffer
+import java.util.Locale
 import kotlin.math.abs
 
 enum class LyricsStatus { IDLE, LOADING, READY, UNAVAILABLE }
@@ -47,6 +48,17 @@ enum class LyricsStatus { IDLE, LOADING, READY, UNAVAILABLE }
 enum class LyricsView { ORIGINAL, TRANSLATION, ROMANIZATION }
 
 enum class ExtraStatus { IDLE, LOADING, READY, SAME, UNAVAILABLE }
+
+/** One source that has synced lyrics for the current track. [kind] is "word" or "line" timing. */
+data class LyricsSourceItem(val id: String, val label: String, val kind: String)
+
+/** The phone's answer to "which sources have this song": it grows while the phone is still asking. */
+data class SourcesUi(
+    val trackId: String? = null,
+    val items: List<LyricsSourceItem> = emptyList(),
+    val currentId: String = "",
+    val loading: Boolean = false,
+)
 
 /** How well the watch knows where the phone's playhead is: how many fixes, and the best round trip. */
 data class SyncInfo(val fixCount: Int = 0, val bestRttMs: Long = -1L)
@@ -113,13 +125,13 @@ class LyricsViewModel(application: Application) : AndroidViewModel(application),
     private val _positionMs = MutableStateFlow(0L)
     val positionMs: StateFlow<Long> = _positionMs.asStateFlow()
 
-    /**
-     * The user's own fine adjustment, in ms, kept across runs (long-press the lyrics screen).
-     * Positive = lyrics appear earlier, negative = later. It absorbs what cannot be measured:
-     * earbud delay, how far ahead the phone lights a line, the radio's uneven delay.
-     */
-    private val _trimMs = MutableStateFlow(prefs.getInt(KEY_TRIM_MS, 0))
-    val trimMs: StateFlow<Int> = _trimMs.asStateFlow()
+    /** Text size, kept across runs: 1.0 is the default. */
+    private val _fontScale = MutableStateFlow(prefs.getFloat(KEY_FONT_SCALE, 1f))
+    val fontScale: StateFlow<Float> = _fontScale.asStateFlow()
+
+    private val _sources = MutableStateFlow(SourcesUi())
+    val sources: StateFlow<SourcesUi> = _sources.asStateFlow()
+    private var sourcesTimeoutJob: Job? = null
 
     private val _events = MutableSharedFlow<LyricsEvent>(
         extraBufferCapacity = 8,
@@ -263,15 +275,42 @@ class LyricsViewModel(application: Application) : AndroidViewModel(application),
         updateTicker()
     }
 
-    fun nudgeTrim(deltaMs: Int) {
-        val next = (_trimMs.value + deltaMs).coerceIn(-TRIM_LIMIT_MS, TRIM_LIMIT_MS)
-        if (next == _trimMs.value) return
-        val displayed = if (nowPlaying != null) currentPositionMs() else 0L
-        _trimMs.value = next
-        prefs.edit().putInt(KEY_TRIM_MS, next).apply()
-        if (nowPlaying != null) {
-            rebaseFrom(displayed)
-            tick()
+    fun cycleFontScale() {
+        val steps = FONT_SCALES
+        val next = steps[(steps.indexOfFirst { it >= _fontScale.value - 0.01f }.let { if (it < 0) 0 else it } + 1) % steps.size]
+        _fontScale.value = next
+        prefs.edit().putFloat(KEY_FONT_SCALE, next).apply()
+    }
+
+    /** Where to seek the phone so that [line] starts: the same rule as tapping a line on the phone. */
+    fun seekTargetMs(line: SyncedLine): Long = (line.startMs + lyricsOffsetMs).coerceAtLeast(0L)
+
+    /** The watch opened its source list: the phone asks every enabled source and answers as they come. */
+    fun openSources() {
+        val id = _state.value.trackId
+        if (id.isNullOrEmpty()) return
+        _sources.update { if (it.trackId == id) it.copy(loading = true) else SourcesUi(trackId = id, loading = true) }
+        sourcesTimeoutJob?.cancel()
+        viewModelScope.launch {
+            val nodes = nodeClient.connectedNodes.awaitOrNull().orEmpty()
+            val body = id.toByteArray(Charsets.UTF_8)
+            nodes.forEach { messageClient.sendMessage(it.id, WearSyncPaths.LYRICS_SOURCES_REQUEST, body).awaitOrNull() }
+        }
+        // 17 sources on a slow day: stop showing the spinner, whatever has arrived stays.
+        sourcesTimeoutJob = viewModelScope.launch {
+            delay(SOURCES_TIMEOUT_MS)
+            _sources.update { it.copy(loading = false) }
+        }
+    }
+
+    fun selectSource(sourceId: String) {
+        val id = _state.value.trackId
+        if (id.isNullOrEmpty()) return
+        _sources.update { it.copy(currentId = sourceId) }
+        viewModelScope.launch {
+            val nodes = nodeClient.connectedNodes.awaitOrNull().orEmpty()
+            val body = "$id\n$sourceId".toByteArray(Charsets.UTF_8)
+            nodes.forEach { messageClient.sendMessage(it.id, WearSyncPaths.LYRICS_SELECT, body).awaitOrNull() }
         }
     }
 
@@ -308,18 +347,22 @@ class LyricsViewModel(application: Application) : AndroidViewModel(application),
         var payloadMap: DataMap? = null
         var extraMap: DataMap? = null
         var offsetMap: DataMap? = null
+        var sourcesMap: DataMap? = null
         for (event in events) {
             if (event.type != DataEvent.TYPE_CHANGED) continue
             when (event.dataItem.uri.path) {
                 WearSyncPaths.LYRICS_PAYLOAD -> payloadMap = DataMapItem.fromDataItem(event.dataItem).dataMap
                 WearSyncPaths.LYRICS_EXTRA -> extraMap = DataMapItem.fromDataItem(event.dataItem).dataMap
                 WearSyncPaths.LYRICS_OFFSET -> offsetMap = DataMapItem.fromDataItem(event.dataItem).dataMap
+                WearSyncPaths.LYRICS_SOURCES -> sourcesMap = DataMapItem.fromDataItem(event.dataItem).dataMap
             }
         }
         val payload = payloadMap
         val extra = extraMap
         if (payload != null) viewModelScope.launch { handlePayloadDataMap(payload) }
         if (extra != null) viewModelScope.launch { handleExtraDataMap(extra) }
+        val sourcesItem = sourcesMap
+        if (sourcesItem != null) viewModelScope.launch { handleSourcesDataMap(sourcesItem) }
         val offset = offsetMap
         if (offset != null) viewModelScope.launch { applyOffset(offset.getInt(WearSyncPaths.KEY_OFFSET_MS, 0)) }
     }
@@ -365,6 +408,27 @@ class LyricsViewModel(application: Application) : AndroidViewModel(application),
             null
         } ?: return
         handlePayloadDataMap(map)
+    }
+
+    private fun handleSourcesDataMap(map: DataMap) {
+        val trackId = map.getString(WearSyncPaths.KEY_TRACK_ID) ?: return
+        if (trackId != _state.value.trackId) return
+        val ids = map.getStringArrayList(WearSyncPaths.KEY_IDS).orEmpty()
+        val labels = map.getStringArrayList(WearSyncPaths.KEY_LABELS).orEmpty()
+        val kinds = map.getStringArrayList(WearSyncPaths.KEY_KINDS).orEmpty()
+        val items = ids.indices.map { i ->
+            LyricsSourceItem(ids[i], labels.getOrElse(i) { ids[i] }, kinds.getOrElse(i) { "line" })
+        }
+        val done = map.getBoolean(WearSyncPaths.KEY_DONE, false)
+        if (done) sourcesTimeoutJob?.cancel()
+        _sources.update {
+            SourcesUi(
+                trackId = trackId,
+                items = items,
+                currentId = map.getString(WearSyncPaths.KEY_CURRENT).orEmpty().ifEmpty { it.currentId },
+                loading = !done,
+            )
+        }
     }
 
     private suspend fun restoreOffset() {
@@ -448,6 +512,12 @@ class LyricsViewModel(application: Application) : AndroidViewModel(application),
         runCatching { LyricsView.valueOf(prefs.getString(KEY_VIEW_MODE, null) ?: "ORIGINAL") }
             .getOrDefault(LyricsView.ORIGINAL)
 
+    /** The language this watch is set to: that is the one a translation is wanted in. */
+    private fun watchLanguage(): String {
+        val locale = Locale.getDefault()
+        return if (locale.language == "zh") locale.toLanguageTag() else locale.language
+    }
+
     private fun kindOf(mode: LyricsView): String = when (mode) {
         LyricsView.TRANSLATION -> WearSyncPaths.KIND_TRANSLATION
         LyricsView.ROMANIZATION -> WearSyncPaths.KIND_ROMANIZATION
@@ -461,7 +531,7 @@ class LyricsViewModel(application: Application) : AndroidViewModel(application),
         if (id.isNullOrEmpty()) return
         viewModelScope.launch {
             val nodes = nodeClient.connectedNodes.awaitOrNull().orEmpty()
-            val body = "$id\n${kindOf(mode)}".toByteArray(Charsets.UTF_8)
+            val body = "$id\n${kindOf(mode)}\n${watchLanguage()}".toByteArray(Charsets.UTF_8)
             nodes.forEach { messageClient.sendMessage(it.id, WearSyncPaths.LYRICS_TRANSFORM, body).awaitOrNull() }
         }
         if (mode == LyricsView.ORIGINAL) return
@@ -493,6 +563,7 @@ class LyricsViewModel(application: Application) : AndroidViewModel(application),
 
     private fun startTrack(id: String?, title: String, artist: String) {
         lyricsRequestJob?.cancel()
+        _sources.value = SourcesUi()
         payload = null
         _state.update {
             it.copy(
@@ -572,7 +643,7 @@ class LyricsViewModel(application: Application) : AndroidViewModel(application),
         // A fix on the phone's playhead beats arithmetic on stamps from two different clocks.
         val base = if (np.advancing) fixPositionAt(wall) ?: positionOf(np, wall) else np.positionMs
         val max = if (np.durationMs > 0) np.durationMs else Long.MAX_VALUE
-        return base.coerceAtMost(max) + _trimMs.value - lyricsOffsetMs
+        return base.coerceAtMost(max) - lyricsOffsetMs
     }
 
     /** [np] run on from its stamp to [watchWall], with the stamp read on the watch's own clock. */
@@ -732,10 +803,12 @@ class LyricsViewModel(application: Application) : AndroidViewModel(application),
         if (natural) {
             val line = p!!.lines[idx]
             val prevLine = p.lines.getOrNull(prevIdx)
-            _events.tryEmit(
-                if (line.isChorus && prevLine?.isChorus != true) LyricsEvent.ChorusEntered
-                else LyricsEvent.LineChanged,
-            )
+            if (!line.isGap) {
+                _events.tryEmit(
+                    if (line.isChorus && prevLine?.isChorus != true) LyricsEvent.ChorusEntered
+                    else LyricsEvent.LineChanged,
+                )
+            }
         }
     }
 
@@ -764,7 +837,8 @@ class LyricsViewModel(application: Application) : AndroidViewModel(application),
         const val MAX_CLOCK_RTT_MS = 4_000L
         const val CLOCK_SAMPLE_TTL_MS = 300_000L
 
-        const val KEY_TRIM_MS = "trim_ms"
-        const val TRIM_LIMIT_MS = 3_000
+        const val KEY_FONT_SCALE = "font_scale"
+        val FONT_SCALES = floatArrayOf(0.9f, 1f, 1.15f, 1.3f)
+        const val SOURCES_TIMEOUT_MS = 45_000L
     }
 }

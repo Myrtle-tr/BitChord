@@ -14,6 +14,13 @@
     <string name="wear_lyrics_tune_title">Sync</string>
     <string name="wear_lyrics_later">Later</string>
     <string name="wear_lyrics_earlier">Earlier</string>
+    <string name="wear_lyrics_close">Close</string>
+    <string name="wear_lyrics_source">Lyrics source</string>
+    <string name="wear_lyrics_source_back">Back</string>
+    <string name="wear_lyrics_source_searching">Searching…</string>
+    <string name="wear_lyrics_source_none">No source has synced lyrics for this song</string>
+    <string name="wear_lyrics_source_word">Word by word</string>
+    <string name="wear_lyrics_source_line">Line by line</string>
     <string name="wear_lyrics_keep_awake">Keep screen on</string>
     <string name="wear_lyrics_keep_awake_on">Screen stays on</string>
     <string name="wear_lyrics_auto_sync">Auto sync</string>

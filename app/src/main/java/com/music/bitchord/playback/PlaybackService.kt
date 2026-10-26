@@ -7226,7 +7226,7 @@ class PlaybackService : MediaLibraryService() {
         if (!AppSettings.syncedLyrics.value) {
             serviceLyrics = null
             stopLyricsTicker()
-            WearLyricsSync.publish(applicationContext, currentSong.videoId, currentSong.title, currentSong.artist, 0L, null)
+            WearLyricsSync.publish(applicationContext, currentSong.videoId, currentSong.title, currentSong.artist, 0L, null, album = currentSong.albumName)
             return
         }
 
@@ -7254,7 +7254,7 @@ class PlaybackService : MediaLibraryService() {
             }
             withContext(Dispatchers.Main) {
                 serviceLyrics = lines
-                WearLyricsSync.publish(applicationContext, currentSong.videoId, currentSong.title, currentSong.artist, trackDurationMs, lines)
+                WearLyricsSync.publish(applicationContext, currentSong.videoId, currentSong.title, currentSong.artist, trackDurationMs, lines, album = currentSong.albumName)
                 if (player?.isPlaying == true) {
                     updateLyricSubtitle()
                 }

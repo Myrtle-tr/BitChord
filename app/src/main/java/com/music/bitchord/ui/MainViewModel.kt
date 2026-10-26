@@ -442,6 +442,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         com.music.bitchord.wear.WearLyricsSync.publish(
             getApplication<android.app.Application>(),
             request.videoId, request.title, request.artist, request.durationMs, lines,
+            album = request.album,
             fromUi = true,
         )
     }

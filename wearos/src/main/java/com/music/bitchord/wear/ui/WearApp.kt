@@ -90,6 +90,7 @@ fun WearApp(link: PhoneLink) {
                     onPrevious = link::previous,
                     onNext = link::next,
                     onTogglePlay = link::togglePlay,
+                    onSeek = link::seekTo,
                 )
             }
             composable(OUTPUT) {

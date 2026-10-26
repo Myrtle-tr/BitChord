@@ -24,6 +24,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.State
@@ -44,6 +45,8 @@ import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.rotary.onRotaryScrollEvent
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalViewConfiguration
+import androidx.compose.ui.platform.ViewConfiguration
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.res.stringResource
@@ -63,15 +66,20 @@ import androidx.wear.compose.foundation.lazy.items
 import androidx.wear.compose.foundation.lazy.rememberScalingLazyListState
 import androidx.wear.compose.foundation.requestFocusOnHierarchyActive
 import androidx.wear.compose.material3.Text
+import com.music.bitchord.shared.wear.SyncedLine
 import com.music.bitchord.wear.R
 import com.music.bitchord.wear.data.NowPlaying
 import kotlinx.coroutines.delay
+import kotlin.math.roundToInt
 import kotlin.math.abs
 
 private const val IDLE_SNAPBACK_MS = 4_000L
 private const val CONTROLS_HIDE_MS = 4_000L
 private val SwipeThreshold = 64.dp
-private const val TRIM_STEP_MS = 50
+
+/** How long a press has to be held to open the panel: longer than the system's, so it is not opened by accident. */
+private const val LONG_PRESS_MS = 900L
+private const val TUNE_PANEL_MS = 8_000L
 private const val KEEP_AWAKE_PAUSE_LIMIT_MS = 30_000L
 
 /**
@@ -93,6 +101,7 @@ fun LyricsScreen(
     onPrevious: () -> Unit,
     onNext: () -> Unit,
     onTogglePlay: () -> Unit,
+    onSeek: (Long) -> Unit,
     modifier: Modifier = Modifier,
     viewModel: LyricsViewModel = viewModel(),
 ) {
@@ -100,7 +109,8 @@ fun LyricsScreen(
     val state by viewModel.state.collectAsStateWithLifecycle()
     val positionState = viewModel.positionMs.collectAsStateWithLifecycle()
     val ambient = LocalAmbient.current
-    val trimMs by viewModel.trimMs.collectAsStateWithLifecycle()
+    val fontScale by viewModel.fontScale.collectAsStateWithLifecycle()
+    val sources by viewModel.sources.collectAsStateWithLifecycle()
     val syncInfo by viewModel.syncInfo.collectAsStateWithLifecycle()
 
     // The clock only runs while this screen is on.
@@ -134,6 +144,13 @@ fun LyricsScreen(
         }
     }
 
+    val baseConfiguration = LocalViewConfiguration.current
+    val slowLongPress = remember(baseConfiguration) {
+        object : ViewConfiguration by baseConfiguration {
+            override val longPressTimeoutMillis: Long get() = LONG_PRESS_MS
+        }
+    }
+
     BoxWithConstraints(modifier.fillMaxSize().background(Color.Black)) {
         val w = maxWidth
         val h = maxHeight
@@ -141,6 +158,7 @@ fun LyricsScreen(
         // The mesh is bright; lyrics are all text, so it is pushed well back.
         Spacer(Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.5f)))
 
+        CompositionLocalProvider(LocalViewConfiguration provides slowLongPress) {
         LyricsBody(
             state = state,
             positionState = positionState,
@@ -152,13 +170,18 @@ fun LyricsScreen(
             onPrevious = onPrevious,
             onNext = onNext,
             onTogglePlay = onTogglePlay,
-            trimMs = trimMs,
             syncInfo = syncInfo,
-            onTrim = viewModel::nudgeTrim,
+            fontScale = fontScale,
+            sources = sources,
+            onCycleFont = viewModel::cycleFontScale,
+            onOpenSources = viewModel::openSources,
+            onSelectSource = viewModel::selectSource,
+            onSeekLine = { line -> onSeek(viewModel.seekTargetMs(line)) },
             onTranslate = viewModel::toggleTranslation,
             onRomanize = viewModel::toggleRomanization,
             onRetry = viewModel::requestLyrics,
         )
+        }
     }
 }
 
@@ -174,9 +197,13 @@ private fun LyricsBody(
     onPrevious: () -> Unit,
     onNext: () -> Unit,
     onTogglePlay: () -> Unit,
-    trimMs: Int,
     syncInfo: SyncInfo,
-    onTrim: (Int) -> Unit,
+    fontScale: Float,
+    sources: SourcesUi,
+    onCycleFont: () -> Unit,
+    onOpenSources: () -> Unit,
+    onSelectSource: (String) -> Unit,
+    onSeekLine: (SyncedLine) -> Unit,
     onTranslate: () -> Unit,
     onRomanize: () -> Unit,
     onRetry: () -> Unit,
@@ -187,6 +214,7 @@ private fun LyricsBody(
         runCatching { context.packageManager.getPackageInfo(context.packageName, 0).versionName }.getOrNull().orEmpty()
     }
     var showTune by remember { mutableStateOf(false) }
+    var showSources by remember { mutableStateOf(false) }
     var tuneStamp by remember { mutableLongStateOf(0L) }
 
     // "Keep the screen on": until the song changes, the screen is left, or the song has been paused
@@ -224,10 +252,16 @@ private fun LyricsBody(
 
     val onNextState by rememberUpdatedState(onNext)
 
+    fun openTune() {
+        view.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+        showTune = true
+        tuneStamp = SystemClock.elapsedRealtime()
+    }
+
     // The tuning panel closes itself after 5 s without a tap.
     LaunchedEffect(tuneStamp) {
         if (showTune) {
-            delay(5_000L)
+            delay(TUNE_PANEL_MS)
             showTune = false
         }
     }
@@ -276,13 +310,7 @@ private fun LyricsBody(
             .fillMaxSize()
             // Long press: the sync panel. A drag or a swipe cancels it, so scrolling is unaffected.
             .pointerInput(Unit) {
-                detectTapGestures(
-                    onLongPress = {
-                        view.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
-                        showTune = true
-                        tuneStamp = SystemClock.elapsedRealtime()
-                    },
-                )
+                detectTapGestures(onLongPress = { openTune() })
             }
             // Any touch wakes the controls. Observed in the Initial pass and never consumed.
             .pointerInput(Unit) {
@@ -341,8 +369,10 @@ private fun LyricsBody(
                     )
                 }
                 items(count = lines.size, key = { lines[it].index }) { i ->
+                    val line = lines[i]
                     LyricLineItem(
-                        line = lines[i],
+                        line = line,
+                        fontScale = fontScale,
                         isActive = i == state.activeLineIndex,
                         positionState = positionState,
                         altText = if (state.viewMode != LyricsView.ORIGINAL && state.extraStatus == ExtraStatus.READY) {
@@ -350,7 +380,23 @@ private fun LyricsBody(
                         } else {
                             null
                         },
-                        modifier = Modifier.padding(horizontal = 20.dp),
+                        // A tap sends the phone to this line (the same rule as tapping one there). The
+                        // line handles its own long press too: otherwise releasing a long press over it
+                        // would count as a tap and jump.
+                        modifier = Modifier
+                            .padding(horizontal = 20.dp)
+                            .pointerInput(line.index) {
+                                detectTapGestures(
+                                    onTap = {
+                                        if (!line.isGap) {
+                                            view.performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK)
+                                            userBrowsing = false
+                                            onSeekLine(line)
+                                        }
+                                    },
+                                    onLongPress = { openTune() },
+                                )
+                            },
                     )
                 }
             }
@@ -368,7 +414,7 @@ private fun LyricsBody(
             Modifier
                 .align(Alignment.BottomCenter)
                 .fillMaxWidth()
-                .height(h * 0.36f)
+                .height(h * 0.40f)
                 .background(Brush.verticalGradient(listOf(Color.Transparent, Color.Black.copy(alpha = 0.9f)))),
         )
 
@@ -377,24 +423,25 @@ private fun LyricsBody(
             animationSpec = tween(durationMillis = 400),
             label = "lyricsControlsAlpha",
         )
-        if (showTune) {
+        if (showTune && !showSources) {
             TunePanel(
-                trimMs = trimMs,
-                syncInfo = syncInfo,
                 keepAwake = keepAwake,
                 onKeepAwake = {
                     keepAwake = !keepAwake
                     tuneStamp = SystemClock.elapsedRealtime()
                 },
+                fontScale = fontScale,
+                onCycleFont = {
+                    onCycleFont()
+                    tuneStamp = SystemClock.elapsedRealtime()
+                },
+                onOpenSources = {
+                    showSources = true
+                    onOpenSources()
+                },
+                onClose = { showTune = false },
+                syncInfo = syncInfo,
                 versionName = versionName,
-                onLater = {
-                    onTrim(-TRIM_STEP_MS)
-                    tuneStamp = SystemClock.elapsedRealtime()
-                },
-                onEarlier = {
-                    onTrim(TRIM_STEP_MS)
-                    tuneStamp = SystemClock.elapsedRealtime()
-                },
                 modifier = Modifier.align(Alignment.Center),
             )
         }
@@ -404,7 +451,7 @@ private fun LyricsBody(
         Row(
             modifier = Modifier
                 .align(Alignment.BottomCenter)
-                .padding(bottom = h * 0.10f)
+                .padding(bottom = h * 0.155f)
                 .alpha(controlsAlpha),
             horizontalArrangement = Arrangement.spacedBy(w * 0.02f),
             verticalAlignment = Alignment.CenterVertically,
@@ -456,64 +503,62 @@ private fun LyricsBody(
                 onClick = onRomanize,
             )
         }
+
+        if (showSources) {
+            SourcePicker(
+                sources = sources,
+                onSelect = { id ->
+                    onSelectSource(id)
+                    showSources = false
+                    showTune = false
+                },
+                onClose = { showSources = false },
+            )
+        }
     }
 }
 
-/** Long-press panel: nudge the lyrics by 50 ms steps. The value is kept across runs. */
+/** Long-press panel. It closes itself after a few seconds, or with the cross. */
 @Composable
 private fun TunePanel(
-    trimMs: Int,
-    syncInfo: SyncInfo,
     keepAwake: Boolean,
     onKeepAwake: () -> Unit,
+    fontScale: Float,
+    onCycleFont: () -> Unit,
+    onOpenSources: () -> Unit,
+    onClose: () -> Unit,
+    syncInfo: SyncInfo,
     versionName: String,
-    onLater: () -> Unit,
-    onEarlier: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     Column(
         modifier = modifier
             .clip(RoundedCornerShape(24.dp))
-            .background(Color.Black.copy(alpha = 0.9f))
+            .background(Color.Black.copy(alpha = 0.92f))
             .padding(horizontal = 14.dp, vertical = 10.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.spacedBy(5.dp),
+        verticalArrangement = Arrangement.spacedBy(6.dp),
     ) {
-        Text(
-            text = stringResource(R.string.wear_lyrics_tune_title),
-            style = WearType.caption,
-            color = Color.White.copy(alpha = 0.7f),
-        )
-        Row(
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(10.dp),
-        ) {
-            TuneButton(label = stringResource(R.string.wear_lyrics_later), onClick = onLater)
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            TunePill(text = "✕", description = stringResource(R.string.wear_lyrics_close), onClick = onClose)
             Text(
-                text = (if (trimMs > 0) "+" else "") + "$trimMs ms",
-                style = WearType.row,
-                color = LyricsPalette.Cyan,
-            )
-            TuneButton(label = stringResource(R.string.wear_lyrics_earlier), onClick = onEarlier)
-        }
-        Box(
-            Modifier
-                .clip(CircleShape)
-                .background(if (keepAwake) LyricsPalette.Cyan else Color.White.copy(alpha = 0.16f))
-                .clickable(onClick = onKeepAwake)
-                .padding(horizontal = 12.dp, vertical = 6.dp),
-        ) {
-            Text(
-                text = stringResource(
-                    if (keepAwake) R.string.wear_lyrics_keep_awake_on else R.string.wear_lyrics_keep_awake,
-                ),
+                text = stringResource(R.string.wear_lyrics_tune_title),
                 style = WearType.caption,
-                color = if (keepAwake) Color.Black else Color.White,
+                color = Color.White.copy(alpha = 0.7f),
             )
+        }
+        TunePill(
+            text = stringResource(if (keepAwake) R.string.wear_lyrics_keep_awake_on else R.string.wear_lyrics_keep_awake),
+            active = keepAwake,
+            onClick = onKeepAwake,
+        )
+        Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
+            TunePill(text = "Aa " + (fontScale * 100).roundToInt() + "%", onClick = onCycleFont)
+            TunePill(text = stringResource(R.string.wear_lyrics_source) + " ›", onClick = onOpenSources)
         }
         Text(
             text = if (syncInfo.fixCount > 0) {
-                stringResource(R.string.wear_lyrics_auto_sync) + ": ${syncInfo.fixCount} • ${syncInfo.bestRttMs} ms"
+                stringResource(R.string.wear_lyrics_auto_sync) + ": " + syncInfo.fixCount + " • " + syncInfo.bestRttMs + " ms"
             } else {
                 stringResource(R.string.wear_lyrics_auto_sync_waiting)
             },
@@ -521,21 +566,122 @@ private fun TunePanel(
             color = Color.White.copy(alpha = 0.5f),
         )
         if (versionName.isNotEmpty()) {
-            Text(text = "v$versionName", style = WearType.caption, color = Color.White.copy(alpha = 0.4f))
+            Text(text = "v" + versionName, style = WearType.caption, color = Color.White.copy(alpha = 0.4f))
         }
     }
 }
 
 @Composable
-private fun TuneButton(label: String, onClick: () -> Unit) {
+private fun TunePill(
+    text: String,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+    active: Boolean = false,
+    description: String? = null,
+) {
     Box(
-        Modifier
+        modifier
             .clip(CircleShape)
-            .background(Color.White.copy(alpha = 0.16f))
+            .background(if (active) LyricsPalette.Cyan else Color.White.copy(alpha = 0.16f))
+            .clickable(onClick = onClick)
+            .semantics { if (description != null) contentDescription = description }
+            .padding(horizontal = 12.dp, vertical = 7.dp),
+    ) {
+        Text(text = text, style = WearType.caption, color = if (active) Color.Black else Color.White)
+    }
+}
+
+/**
+ * Which sources have synced lyrics for this song, as the phone finds them: only those that answered
+ * with lyrics are listed, and the list grows while the phone is still asking.
+ */
+@Composable
+private fun SourcePicker(
+    sources: SourcesUi,
+    onSelect: (String) -> Unit,
+    onClose: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val listState = rememberScalingLazyListState()
+    Box(
+        modifier
+            .fillMaxSize()
+            .background(Color.Black.copy(alpha = 0.95f))
+            .pointerInput(Unit) { detectTapGestures { } },
+    ) {
+        ScalingLazyColumn(
+            state = listState,
+            modifier = Modifier.fillMaxSize(),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(6.dp),
+            contentPadding = PaddingValues(horizontal = 14.dp),
+        ) {
+            item(key = "back") {
+                TunePill(text = "‹ " + stringResource(R.string.wear_lyrics_source_back), onClick = onClose)
+            }
+            item(key = "title") {
+                Text(
+                    text = stringResource(R.string.wear_lyrics_source),
+                    style = WearType.header,
+                    color = Color.White,
+                    textAlign = TextAlign.Center,
+                )
+            }
+            items(count = sources.items.size, key = { sources.items[it].id }) { i ->
+                val item = sources.items[i]
+                SourceRow(item = item, current = item.id == sources.currentId, onClick = { onSelect(item.id) })
+            }
+            if (sources.loading) {
+                item(key = "searching") {
+                    Text(
+                        text = stringResource(R.string.wear_lyrics_source_searching),
+                        style = WearType.caption,
+                        color = Color.White.copy(alpha = 0.6f),
+                    )
+                }
+            } else if (sources.items.isEmpty()) {
+                item(key = "none") {
+                    Text(
+                        text = stringResource(R.string.wear_lyrics_source_none),
+                        style = WearType.caption,
+                        color = Color.White.copy(alpha = 0.6f),
+                        textAlign = TextAlign.Center,
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun SourceRow(item: LyricsSourceItem, current: Boolean, onClick: () -> Unit) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(20.dp))
+            .background(if (current) LyricsPalette.Cyan.copy(alpha = 0.22f) else Color.White.copy(alpha = 0.10f))
             .clickable(onClick = onClick)
             .padding(horizontal = 12.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
     ) {
-        Text(text = label, style = WearType.button, color = Color.White)
+        Column(Modifier.weight(1f)) {
+            Text(
+                text = item.label,
+                style = WearType.row,
+                color = Color.White,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Text(
+                text = stringResource(
+                    if (item.kind == "word") R.string.wear_lyrics_source_word else R.string.wear_lyrics_source_line,
+                ),
+                style = WearType.caption,
+                color = Color.White.copy(alpha = 0.55f),
+            )
+        }
+        if (current) Text(text = "✓", style = WearType.row, color = LyricsPalette.Cyan)
     }
 }
 

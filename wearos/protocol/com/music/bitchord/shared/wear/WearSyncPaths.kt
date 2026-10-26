@@ -10,6 +10,20 @@ object WearSyncPaths {
     const val PLAYBACK_COMMAND = "/bitchord/playback/command"
     const val LYRICS_REQUEST = "/bitchord/lyrics/request"
 
+    /** Watch -> phone: "trackId", asks which sources have synced lyrics for it. Answer: [LYRICS_SOURCES]. */
+    const val LYRICS_SOURCES_REQUEST = "/bitchord/lyrics/sources/request"
+
+    /** Watch -> phone: "trackId\nsourceId", play the lyrics of that source on the watch. */
+    const val LYRICS_SELECT = "/bitchord/lyrics/select"
+
+    /** Phone -> watch (DataClient): the sources that have synced lyrics for the track, as they are found. */
+    const val LYRICS_SOURCES = "/bitchord/lyrics/sources"
+    const val KEY_IDS = "ids"
+    const val KEY_LABELS = "labels"
+    const val KEY_KINDS = "kinds"
+    const val KEY_CURRENT = "current"
+    const val KEY_DONE = "done"
+
     /** Phone -> watch (DataClient): the player's lyrics offset in ms; positive = lyrics later. */
     const val LYRICS_OFFSET = "/bitchord/lyrics/offset"
     const val KEY_OFFSET_MS = "offsetMs"
