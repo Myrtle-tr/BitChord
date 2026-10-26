@@ -1,9 +1,29 @@
 package com.music.bitchord.wear.ui
 
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.animateDpAsState
+import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.spring
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.shrinkVertically
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.State
@@ -11,7 +31,9 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Shadow
@@ -23,6 +45,7 @@ import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.withStyle
+import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.wear.compose.material3.Text
 import com.music.bitchord.shared.wear.SyncedLine
@@ -42,6 +65,8 @@ object LyricsPalette {
 private const val ACTIVE_SCALE = 1.14f
 private const val INACTIVE_ALPHA = 0.38f
 private const val SYLLABLE_PULSE_SCALE = 1.025f
+private const val BG_LEAD_MS = 250L
+private const val BG_TAIL_MS = 700L
 
 /**
  * One lyric line.
@@ -62,7 +87,25 @@ fun LyricLineItem(
     positionState: State<Long>,
     modifier: Modifier = Modifier,
     altText: String? = null,
+    fontScale: Float = 1f,
     ambient: Boolean = false,
+) {
+    if (line.isGap) {
+        InterludeDots(line, isActive, positionState, modifier)
+    } else {
+        SungLine(line, isActive, positionState, modifier, altText, fontScale, ambient)
+    }
+}
+
+@Composable
+private fun SungLine(
+    line: SyncedLine,
+    isActive: Boolean,
+    positionState: State<Long>,
+    modifier: Modifier,
+    altText: String?,
+    fontScale: Float,
+    ambient: Boolean,
 ) {
     val highlight = isActive && !ambient
     val alternative = altText?.takeIf { it.isNotBlank() }
@@ -104,8 +147,8 @@ fun LyricLineItem(
         else -> AnnotatedString(line.text)
     }
 
-    Text(
-        text = text,
+    Column(
+        horizontalAlignment = Alignment.CenterHorizontally,
         modifier = modifier
             .fillMaxWidth()
             .graphicsLayer {
@@ -114,13 +157,95 @@ fun LyricLineItem(
                 scaleY = s
                 this.alpha = alpha
             },
-        textAlign = TextAlign.Center,
-        color = if (ambient) LyricsPalette.AmbientPrimary else Color.White,
-        fontFamily = SFPro,
-        fontSize = 15.sp,
-        lineHeight = 19.sp,
-        fontWeight = if (highlight) FontWeight.Bold else FontWeight.Medium,
+    ) {
+        Text(
+            text = text,
+            modifier = Modifier.fillMaxWidth(),
+            textAlign = TextAlign.Center,
+            color = if (ambient) LyricsPalette.AmbientPrimary else Color.White,
+            fontFamily = SFPro,
+            fontSize = 15.sp * fontScale,
+            lineHeight = 19.sp * fontScale,
+            fontWeight = if (highlight) FontWeight.Bold else FontWeight.Medium,
+        )
+        if (highlight) BackgroundVocal(line, positionState, fontScale)
+    }
+}
+
+/**
+ * The answering vocal, sung under the lead. It is small, comes in while it is sung and goes again,
+ * and has its own clock: it does not move the line it belongs to.
+ */
+@Composable
+private fun BackgroundVocal(line: SyncedLine, positionState: State<Long>, fontScale: Float) {
+    val text = line.bgText ?: return
+    val position = positionState.value
+    val visible = position >= line.bgStartMs - BG_LEAD_MS && position <= line.bgEndMs + BG_TAIL_MS
+    AnimatedVisibility(
+        visible = visible,
+        enter = fadeIn(tween(220)) + expandVertically(tween(220)),
+        exit = fadeOut(tween(300)) + shrinkVertically(tween(300)),
+    ) {
+        val span = (line.bgEndMs - line.bgStartMs).coerceAtLeast(1L)
+        val fraction = ((position - line.bgStartMs).toFloat() / span).coerceIn(0f, 1f)
+        Text(
+            text = buildSweepText(text, fraction),
+            modifier = Modifier.fillMaxWidth().graphicsLayer { alpha = 0.8f },
+            textAlign = TextAlign.Center,
+            color = LyricsPalette.Upcoming,
+            fontFamily = SFPro,
+            fontSize = 11.sp * fontScale,
+            lineHeight = 14.sp * fontScale,
+            fontWeight = FontWeight.Medium,
+        )
+    }
+}
+
+/**
+ * Three dots for an instrumental stretch, as on the phone: they light one after another across the
+ * gap, so the wait can be read off them, and shrink away just before the singing comes back. Other
+ * gaps stay folded to a hairline, so only the one being played takes room.
+ */
+@Composable
+private fun InterludeDots(
+    line: SyncedLine,
+    isActive: Boolean,
+    positionState: State<Long>,
+    modifier: Modifier,
+) {
+    val height by animateDpAsState(
+        targetValue = if (isActive) 34.dp else 2.dp,
+        animationSpec = spring(dampingRatio = Spring.DampingRatioNoBouncy, stiffness = Spring.StiffnessMediumLow),
+        label = "gapHeight",
     )
+    Box(modifier.fillMaxWidth().height(height), contentAlignment = Alignment.Center) {
+        if (!isActive) return@Box
+        val total = (line.endMs - line.startMs).coerceAtLeast(1L)
+        val progress = ((positionState.value - line.startMs).toFloat() / total).coerceIn(0f, 1f)
+        val breathe by rememberInfiniteTransition(label = "gapBreathe").animateFloat(
+            initialValue = 1f,
+            targetValue = 1.18f,
+            animationSpec = infiniteRepeatable(tween(900, easing = FastOutSlowInEasing), RepeatMode.Reverse),
+            label = "gapBreatheScale",
+        )
+        val outro = if (progress > 0.92f) 1f - (progress - 0.92f) / 0.08f * 0.6f else 1f
+        Row(horizontalArrangement = Arrangement.spacedBy(7.dp), verticalAlignment = Alignment.CenterVertically) {
+            for (i in 0 until 3) {
+                val fill = (progress * 3f - i).coerceIn(0f, 1f)
+                Box(
+                    Modifier
+                        .size(8.dp)
+                        .graphicsLayer {
+                            val scale = breathe * (0.78f + 0.22f * fill) * outro
+                            scaleX = scale
+                            scaleY = scale
+                        }
+                        .clip(CircleShape)
+                        .background(Color.White.copy(alpha = 0.26f + 0.74f * fill)),
+                )
+            }
+        }
+    }
 }
 
 /**

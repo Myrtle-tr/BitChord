@@ -3,7 +3,7 @@
 place_files.py  -  run from the repo root:   python3 place_files.py [--bump]
 
 Takes any of these files from the repo root, uploaded as they are:
-    LyricsViewModel.kt  LyricsScreen.kt  LyricLineItem.kt  WearLyricsSync.kt
+    LyricsViewModel.kt  LyricsScreen.kt  LyricLineItem.kt  WearLyricsSync.kt  SyncedLyricsPayload.kt
 and moves them to their places (old versions are kept as .bak, which git ignores). A file that is
 not in the root is left as it is in the repo. It also makes the small edits: protocol paths,
 MainViewModel hooks, drawables and strings, all idempotent.
@@ -27,6 +27,7 @@ problems = []
 PLACES = {
     "LyricsViewModel.kt": UI,
     "LyricsScreen.kt": UI,
+    "SyncedLyricsPayload.kt": PATHS.parent if PATHS is not None else UI,
     "LyricLineItem.kt": UI,
     "WearLyricsSync.kt": APP_WEAR,
 }
@@ -105,6 +106,23 @@ patch(PATHS, anchor,
     const val KEY_OFFSET_MS = "offsetMs"
 ''', "LYRICS_OFFSET", "offset path")
 
+patch(PATHS, anchor,
+      anchor + '''
+    /** Watch -> phone: "trackId", asks which sources have synced lyrics for it. Answer: [LYRICS_SOURCES]. */
+    const val LYRICS_SOURCES_REQUEST = "/bitchord/lyrics/sources/request"
+
+    /** Watch -> phone: "trackId\\nsourceId", play the lyrics of that source on the watch. */
+    const val LYRICS_SELECT = "/bitchord/lyrics/select"
+
+    /** Phone -> watch (DataClient): the sources that have synced lyrics for the track, as they are found. */
+    const val LYRICS_SOURCES = "/bitchord/lyrics/sources"
+    const val KEY_IDS = "ids"
+    const val KEY_LABELS = "labels"
+    const val KEY_KINDS = "kinds"
+    const val KEY_CURRENT = "current"
+    const val KEY_DONE = "done"
+''', "LYRICS_SOURCES_REQUEST", "source list paths")
+
 print("[3/5] MainViewModel.kt: lyrics the player picks or syncs reach the watch")
 patch(MAIN_VM, "_lyrics.value = embedded", "_lyrics.value = embedded\n                    wearPublishLyrics(embedded)",
       "wearPublishLyrics(embedded)", "embedded lyrics")
@@ -140,6 +158,20 @@ else:
           "            player?.let { WearLyricsSync.Playhead(it.currentPosition, it.isPlaying, it.playbackParameters.speed) }\n"
           "        }\n",
           "WearLyricsSync.playhead", "playhead for clock pings")
+    patch(SERVICE, "currentSong.artist, 0L, null)", "currentSong.artist, 0L, null, album = currentSong.albumName)",
+          "null, album = currentSong.albumName)", "album (lyrics off)")
+    patch(SERVICE, "currentSong.artist, trackDurationMs, lines)", "currentSong.artist, trackDurationMs, lines, album = currentSong.albumName)",
+          "lines, album = currentSong.albumName)", "album (lyrics loaded)")
+
+patch(MAIN_VM, "request.videoId, request.title, request.artist, request.durationMs, lines,\n            fromUi = true,",
+      "request.videoId, request.title, request.artist, request.durationMs, lines,\n            album = request.album,\n            fromUi = true,",
+      "album = request.album,\n            fromUi = true,", "album (player)")
+
+print("[3c/5] WearApp.kt: tapping a line seeks the phone")
+WEAR_APP = UI / "WearApp.kt"
+patch(WEAR_APP, "                    onTogglePlay = link::togglePlay,\n                )",
+      "                    onTogglePlay = link::togglePlay,\n                    onSeek = link::seekTo,\n                )",
+      "onSeek = link::seekTo", "seek from a lyric line")
 
 print("[4/5] resources")
 ICON_HEAD = ('<vector xmlns:android="http://schemas.android.com/apk/res/android"\n    android:width="24dp"\n    android:height="24dp"\n'
@@ -173,6 +205,13 @@ EN = {
     "wear_lyrics_tune_title": "Sync",
     "wear_lyrics_later": "Later",
     "wear_lyrics_earlier": "Earlier",
+    "wear_lyrics_close": "Close",
+    "wear_lyrics_source": "Lyrics source",
+    "wear_lyrics_source_back": "Back",
+    "wear_lyrics_source_searching": "Searching…",
+    "wear_lyrics_source_none": "No source has synced lyrics for this song",
+    "wear_lyrics_source_word": "Word by word",
+    "wear_lyrics_source_line": "Line by line",
     "wear_lyrics_keep_awake": "Keep screen on",
     "wear_lyrics_keep_awake_on": "Screen stays on",
     "wear_lyrics_auto_sync": "Auto sync",
@@ -193,6 +232,13 @@ TR = {
     "wear_lyrics_tune_title": "Senkron",
     "wear_lyrics_later": "Geç",
     "wear_lyrics_earlier": "Erken",
+    "wear_lyrics_close": "Kapat",
+    "wear_lyrics_source": "Söz kaynağı",
+    "wear_lyrics_source_back": "Geri",
+    "wear_lyrics_source_searching": "Aranıyor…",
+    "wear_lyrics_source_none": "Bu şarkı için senkronlu söz kaynağı yok",
+    "wear_lyrics_source_word": "Kelime kelime",
+    "wear_lyrics_source_line": "Satır satır",
     "wear_lyrics_keep_awake": "Ekran açık kalsın",
     "wear_lyrics_keep_awake_on": "Ekran açık kalıyor",
     "wear_lyrics_auto_sync": "Otomatik senkron",
@@ -233,7 +279,7 @@ for f in [APP_WEAR / "WearLyricsSync.kt", UI / "LyricsViewModel.kt", UI / "Lyric
     s = read(f)
     if s.count("{") != s.count("}"):
         problems.append(f"{f.name}: unbalanced braces (an incomplete upload?)")
-for file, needle in ((UI / "LyricsViewModel.kt", "nudgeTrim"), (UI / "LyricsScreen.kt", "keepScreenOn"),
+for file, needle in ((UI / "LyricsViewModel.kt", "openSources"), (UI / "LyricsScreen.kt", "SourcePicker"),
                      (APP_WEAR / "WearLyricsSync.kt", "lastPutKey")):
     if needle not in read(file):
         problems.append(f"{file.name} is not the latest version. Upload it again.")
