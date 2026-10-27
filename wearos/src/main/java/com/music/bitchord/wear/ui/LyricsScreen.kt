@@ -20,6 +20,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -50,6 +51,8 @@ import androidx.compose.ui.platform.ViewConfiguration
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
@@ -79,6 +82,9 @@ private val SwipeThreshold = 64.dp
 
 /** How long a press has to be held to open the panel: longer than the system's, so it is not opened by accident. */
 private const val LONG_PRESS_MS = 900L
+
+/** How far the two outer buttons ride up, as a share of the screen height, to follow the rim. */
+private const val OUTER_BUTTON_RISE = 0.06f
 private const val TUNE_PANEL_MS = 8_000L
 private const val KEEP_AWAKE_PAUSE_LIMIT_MS = 30_000L
 
@@ -414,7 +420,7 @@ private fun LyricsBody(
             Modifier
                 .align(Alignment.BottomCenter)
                 .fillMaxWidth()
-                .height(h * 0.40f)
+                .height(h * 0.36f)
                 .background(Brush.verticalGradient(listOf(Color.Transparent, Color.Black.copy(alpha = 0.9f)))),
         )
 
@@ -446,18 +452,20 @@ private fun LyricsBody(
             )
         }
 
-        // Five buttons need a wider chord of the round screen than three did, so the row sits a
-        // little higher: translate | previous | play | next | Latin-script reading.
+        // translate | previous | play | next | Latin-script reading. The middle three stay where they
+        // were; the two outer ones sit further out, where a round screen is narrower, so they ride
+        // up along the rim (about 6% of the height) to stay inside it.
         Row(
             modifier = Modifier
                 .align(Alignment.BottomCenter)
-                .padding(bottom = h * 0.155f)
+                .padding(bottom = h * 0.10f)
                 .alpha(controlsAlpha),
             horizontalArrangement = Arrangement.spacedBy(w * 0.02f),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             val translating = state.viewMode == LyricsView.TRANSLATION
             val romanizing = state.viewMode == LyricsView.ROMANIZATION
+            Box(Modifier.offset(y = -(h * OUTER_BUTTON_RISE))) {
             GlyphButton(
                 icon = R.drawable.ic_lyrics_translate,
                 description = stringResource(R.string.wear_lyrics_translate),
@@ -467,6 +475,7 @@ private fun LyricsBody(
                 background = if (translating) LyricsPalette.Cyan else Color.White.copy(alpha = 0.14f),
                 onClick = onTranslate,
             )
+            }
             GlyphButton(
                 icon = R.drawable.ic_previous,
                 description = stringResource(R.string.previous),
@@ -493,6 +502,7 @@ private fun LyricsBody(
                 background = Color.White.copy(alpha = 0.14f),
                 onClick = onNext,
             )
+            Box(Modifier.offset(y = -(h * OUTER_BUTTON_RISE))) {
             GlyphButton(
                 icon = R.drawable.ic_lyrics_romanize,
                 description = stringResource(R.string.wear_lyrics_romanize),
@@ -502,6 +512,7 @@ private fun LyricsBody(
                 background = if (romanizing) LyricsPalette.Cyan else Color.White.copy(alpha = 0.14f),
                 onClick = onRomanize,
             )
+            }
         }
 
         if (showSources) {
