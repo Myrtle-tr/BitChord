@@ -30,6 +30,7 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.sync.withPermit
 import java.nio.ByteBuffer
 import java.util.Locale
@@ -67,8 +68,15 @@ object WearLyricsSync : MessageClient.OnMessageReceivedListener {
 
     private const val TAG = "WearLyricsSync"
     private const val TIMEOUT_S = 10L
-    private const val PROBE_PARALLEL = 6
-    private const val RETRY_DELAY_MS = 400L
+    private const val PROBE_PARALLEL = 10
+    private const val RETRY_DELAY_MS = 600L
+
+    /** The list counts as complete after this, whatever is still running; stragglers join it later. */
+    private const val FIRST_PASS_MS = 9_000L
+    private const val PUT_DEBOUNCE_MS = 350L
+
+    /** The watch counts as "open" this long after its last message (its screen pings every 15 s). */
+    private const val WATCH_ACTIVE_MS = 90_000L
     private const val SELECT_REFRESH_MS = 800L
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -105,6 +113,8 @@ object WearLyricsSync : MessageClient.OnMessageReceivedListener {
     @Volatile private var sourcesTrackId: String? = null
     @Volatile private var sourcesDone = false
     private var sourcesJob: Job? = null
+    @Volatile private var lastWatchContactMs = 0L
+    @Volatile private var putPending = false
     private var offsetJob: Job? = null
     @Volatile private var appContext: Context? = null
     @Volatile private var lastPutKey: String? = null
@@ -191,6 +201,9 @@ object WearLyricsSync : MessageClient.OnMessageReceivedListener {
                 val key = "$mediaId#${payload.contentHash}"
                 if (key != lastPutKey && putPayload(app, payload)) lastPutKey = key
                 // The watch is showing a translation: these are different lyrics now.
+                // With the watch's lyrics screen open the source list is worked out now, so it is
+                // ready by the time anyone opens it.
+                if (System.currentTimeMillis() - lastWatchContactMs < WATCH_ACTIVE_MS) handleSourcesRequest(mediaId)
                 val kind = wantedKind
                 if (kind != null && wantedTrack == mediaId) sendExtra(app, mediaId, kind)
             } catch (e: kotlinx.coroutines.CancellationException) {
@@ -209,6 +222,7 @@ object WearLyricsSync : MessageClient.OnMessageReceivedListener {
      *    whatever was sent before
      */
     override fun onMessageReceived(event: MessageEvent) {
+        lastWatchContactMs = System.currentTimeMillis()
         if (event.path == WearSyncPaths.CLOCK_PING) {
             answerClockPing(event)
             return
@@ -285,34 +299,56 @@ object WearLyricsSync : MessageClient.OnMessageReceivedListener {
         val order = AppSettings.lyricsSourceOrder.value
         val candidates = (order + LyricsSource.entries).distinct().filter { it in enabled && !it.hidden }
         val gate = Semaphore(PROBE_PARALLEL)
+
+        /** One try at one source: true if it had synced lyrics. */
+        suspend fun attempt(source: LyricsSource): Boolean {
+            val result = fetchOne(trackId, source) ?: return false
+            val kind = when {
+                result.lines.any { it.isWordSynced } -> "word"
+                result.lines.any { it.timeMs > 0 && it.text.isNotBlank() } -> "line"
+                else -> return false
+            }
+            if (sourcesTrackId != trackId) return true
+            val hash = buildPayload(trackId, result.lines).contentHash
+            sourceHits[source] = SourceHit(source, result, kind, hash)
+            requestPut(app, trackId)
+            return true
+        }
+
         coroutineScope {
-            candidates.map { source ->
-                async {
-                    gate.withPermit {
-                        var result = fetchOne(trackId, source)
-                        if (result == null) {
+            val first = candidates.map { source -> async { gate.withPermit { attempt(source) } } }
+            // Every source is asked at once. The list is called complete after the first answers,
+            // however slow the stragglers are; they still join it when they arrive.
+            withTimeoutOrNull(FIRST_PASS_MS) { first.awaitAll() }
+            if (sourcesTrackId == trackId) {
+                sourcesDone = true
+                putSources(app, trackId, true)
+            }
+            // A source that answered "nothing" gets one more try, quietly, so that a hiccup does
+            // not hide a source that has the lyrics.
+            first.forEachIndexed { i, job ->
+                val missed = job.isCompleted && !runCatching { job.await() }.getOrDefault(true)
+                if (missed) {
+                    launch {
+                        gate.withPermit {
                             delay(RETRY_DELAY_MS)
-                            result = fetchOne(trackId, source)
-                        }
-                        val kind = result?.lines?.let { lines ->
-                            when {
-                                lines.any { it.isWordSynced } -> "word"
-                                lines.any { it.timeMs > 0 && it.text.isNotBlank() } -> "line"
-                                else -> null
-                            }
-                        }
-                        if (result != null && kind != null && sourcesTrackId == trackId) {
-                            val hash = buildPayload(trackId, result.lines).contentHash
-                            sourceHits[source] = SourceHit(source, result, kind, hash)
-                            putSources(app, trackId, false)
+                            attempt(candidates[i])
                         }
                     }
                 }
-            }.awaitAll()
+            }
         }
-        if (sourcesTrackId == trackId) {
-            sourcesDone = true
-            putSources(app, trackId, true)
+        if (sourcesTrackId == trackId) putSources(app, trackId, true)
+    }
+
+    /** The list is sent as it grows, but not more often than a few times a second. */
+    private fun requestPut(app: Context, trackId: String) {
+        if (putPending) return
+        putPending = true
+        scope.launch {
+            delay(PUT_DEBOUNCE_MS)
+            putPending = false
+            putSources(app, trackId, sourcesDone)
         }
     }
 

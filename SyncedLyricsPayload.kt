@@ -228,6 +228,7 @@ data class SyncedLyricsPayload(
             }
 
             // Gaps worth a countdown: the ones the source marks, and the ones its line ends reveal.
+            val endStated = sorted.map { it.endMs != null }
             val withGaps = ArrayList<SyncedLine>()
             val firstReal = converted.firstOrNull { !it.isGap }
             if (firstReal != null && converted.first() === firstReal && firstReal.startMs >= INTRO_GAP_MIN_MS) {
@@ -241,8 +242,14 @@ data class SyncedLyricsPayload(
                 withGaps += line
                 val next = converted.getOrNull(i + 1)
                 if (next != null && !next.isGap) {
-                    val from = line.endMs + GAP_LEAD_MS
-                    if (next.startMs - from >= GAP_MIN_MS) withGaps += gapLine(from, next.startMs, -1)
+                    // A line-timed source does not say when a line stops, only when the next starts. How
+                    // long it takes to sing is then judged from its length, and a longer silence is
+                    // asked for before calling it an instrumental break.
+                    val stated = endStated[i]
+                    val sungEnd = if (stated) line.endMs else minOf(line.endMs, line.startMs + estimatedSungMs(line.text))
+                    val from = sungEnd + GAP_LEAD_MS
+                    val needed = if (stated) GAP_MIN_MS else GAP_MIN_UNSTATED_MS
+                    if (next.startMs - from >= needed) withGaps += gapLine(from, next.startMs, -1)
                 }
             }
             val lines = withGaps.mapIndexed { i, l -> l.copy(index = i) }
@@ -257,6 +264,8 @@ data class SyncedLyricsPayload(
                 contentHash = hashOf(marked),
             )
         }
+
+        private fun estimatedSungMs(text: String): Long = (text.length * 110L).coerceIn(2_500L, 8_000L)
 
         private fun gapLine(start: Long, end: Long, sourceIndex: Int) = SyncedLine(
             index = 0, text = "", startMs = start, endMs = end, syllables = emptyList(),
@@ -321,6 +330,7 @@ data class SyncedLyricsPayload(
 
         /** A silence shorter than this is not worth a countdown. */
         private const val GAP_MIN_MS = 5_000L
+        private const val GAP_MIN_UNSTATED_MS = 6_000L
         private const val INTRO_GAP_MIN_MS = 4_000L
         private const val GAP_LEAD_MS = 300L
         private const val MIN_BG_MS = 1_200L

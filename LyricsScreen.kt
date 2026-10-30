@@ -42,6 +42,8 @@ import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.CompositingStrategy
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.rotary.onRotaryScrollEvent
@@ -459,7 +461,14 @@ private fun LyricsBody(
             modifier = Modifier
                 .align(Alignment.BottomCenter)
                 .padding(bottom = h * 0.10f)
-                .alpha(controlsAlpha),
+                // Fading with Modifier.alpha draws into a separate layer the size of this row, which
+                // cut the raised buttons off at the top (and their touch area with it). Modulating the
+                // alpha draws them in place; the top padding keeps the raised buttons inside the row.
+                .graphicsLayer {
+                    alpha = controlsAlpha
+                    compositingStrategy = CompositingStrategy.ModulateAlpha
+                }
+                .padding(top = h * OUTER_BUTTON_RISE),
             horizontalArrangement = Arrangement.spacedBy(w * 0.02f),
             verticalAlignment = Alignment.CenterVertically,
         ) {
